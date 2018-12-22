@@ -116,7 +116,9 @@ typedef struct context_t {
   unsigned int fetch_issue_delay;
   int icount;
   int fetch_tail, fetch_head;
-  struct fetch_rec *fetch_data
+  struct fetch_rec *fetch_data;
+  int pred_PC;
+  int recover_PC;
 } context;
 
 /* simulated registers */
@@ -135,6 +137,114 @@ static struct mem_t *mem = NULL;
  */
 static int context_num = 0;
 static context contexts[10];
+
+/*
+ * holds the current state for a register
+ */
+enum reg_state {
+  REG_FREE = 0, /* register is free (not allocated to any instruction) */
+  REG_ALLOC,    /* register has been allocated, but not written to yet */
+  REG_WB,       /* register has been written to, but not committed */
+  REG_ARCH      /* register has been committed to the architectural state */
+};
+
+/*
+ * A physical register - only contains state for now
+ */
+struct physreg_t{
+  enum reg_state state; /* the state the register is currently in */
+};
+
+/*
+ * The integer physical register file
+ */
+struct physreg_t* int_reg_file;
+
+/*
+ * The floating-point physical register file
+ */
+struct physreg_t* fp_reg_file;
+
+enum reg_type {
+  REG_NONE = 0, /* No register */
+  REG_INT,      /* Integer register */
+  REG_FP        /* Floating Point register */
+};
+
+/*
+ *  Determines if a free physical register exists
+ *  of the specified type
+ */
+static int find_free_physreg(enum reg_type type){
+  if(type == REG_INT){
+    int i;
+    for(i = 0; i<128; i++){
+      if(int_reg_file[i].state == REG_FREE)
+	return i;
+    }
+    return -1;
+  }else if(type == REG_FP){
+    int i;
+    for(i = 0; i<128; i++){
+      if(fp_reg_file[i].state == REG_FREE)
+	return i;
+    }
+    return -1;
+  }
+  assert(FALSE);
+  return -1;
+}
+
+/* forward declairation */
+struct ROB_entry;
+
+/* 
+ * forward declairation
+ * Allocates physical registers
+ */
+static int alloc_physreg(struct ROB_entry* rob_entry);
+
+//NOTE: Rename tables are kept per-thread in the context
+//See smt.h for details
+
+/*
+ * Prints the state of the rename tables
+ */
+static void print_rename_tables(){
+  int cid, i;
+
+  for(cid = 0; cid < context_num; cid++){
+    printf("RENAME TABLE: THREAD %d\n", cid);
+
+    for(i=0;i<32;i++){
+      printf("$r%d : p%d\n", i, contexts[cid].rename_table[i]);
+    }
+    printf("\n");
+    for(i=32;i<64;i++){
+      printf("$f%d : fp%d\n", i - 32, contexts[cid].rename_table[i]);
+    }
+    printf("\n");
+  }
+}
+
+/*
+ * Contains a set of registers used by an instruction
+ * Indicates the types of each of the sources and destination
+ */
+struct reg_set{
+  enum reg_type src1;  /* type for source 1*/
+  enum reg_type src2;  /* type for source 2*/
+  enum reg_type dest;  /* type for the destination*/
+  int load;            /* is a load? */
+  int store;           /* is a store? */
+};
+
+/*
+ * forward declairation
+ * Used to determine the set of registers needed for an instruction with a specific op-code
+ */
+static void get_reg_set(struct reg_set* my_regs, enum md_opcode op);
+
 /*********************/
 
 /* maximum number of inst's to execute */
@@ -452,6 +562,429 @@ static struct res_pool *fu_pool = NULL;
  * Modified for SMT
  * register renaming
  */
+static void get_reg_set(struct reg_set* my_regs, enum md_opcode op){
+  my_regs->src1 = REG_NONE;
+  my_regs->src2 = REG_NONE;
+  my_regs->dest = REG_NONE;
+  my_regs->load = 0;
+  my_regs->store = 0;
+
+  switch(op){
+  case LDA:
+  case LDAH:
+  case LDBU:
+  case LDQ_U:
+  case LDWU:
+  case LDL:
+  case LDQ:
+  case LDL_L:
+  case LDQ_L:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_INT;
+    my_regs->dest = REG_INT;
+    my_regs->load = 1;
+    break;
+
+  case STW:
+  case STB:
+  case STQ_U:
+  case STL:
+  case STQ:
+  case STL_C:
+  case STQ_C:
+    my_regs->src1 = REG_INT;
+    my_regs->src2 = REG_INT;
+    my_regs->dest = REG_NONE;
+    my_regs->store = 1;
+    break;
+
+  case FLTV:
+  case LDG:
+  case STF:
+  case STG:
+  case PAL_CALLSYS:
+  case SQRTF:
+  case ITOFF:
+  case SQRTG:
+  case TRAPB:
+  case EXCB:
+  case MB:
+  case WMB:
+  case FETCH:
+  case FETCH_M:
+  case _RC:
+  case ECB:
+  case _RS:
+  case WH64:
+  case OP_NA:
+  case CALL_PAL:
+  case LDF:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_NONE;
+    break;
+
+  case LDS:
+  case LDT:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_INT;
+    my_regs->dest = REG_FP;
+    my_regs->load = 1;
+    break;
+    
+  case STS:
+  case STT:
+    my_regs->src1 = REG_FP;
+    my_regs->src2 = REG_INT;
+    my_regs->dest = REG_NONE;
+    break;
+
+  case BR:
+  case BSR:
+  case IMPLVER:
+  case RPCC:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_INT;
+    break;
+
+  case FBEQ:
+  case FBLT:
+  case FBLE:
+  case FBNE:
+  case FBGE:
+  case FBGT:
+    my_regs->src1 = REG_FP;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_NONE;
+    break;
+
+  case BLBC:
+  case BEQ:
+  case BLT:
+  case BLE:
+  case BLBS:
+  case BNE:
+  case BGE:
+  case BGT:
+    my_regs->src1 = REG_INT;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_NONE;
+    break;
+
+  case ADDL:
+  case S4ADDL:
+  case SUBL:
+  case S4SUBL:
+  case CMPBGE:
+  case S8ADDL:
+  case S8SUBL:
+  case CMPULT:
+  case ADDQ:
+  case S4ADDQ:
+  case SUBQ:
+  case S4SUBQ:
+  case CMPEQ:
+  case S8ADDQ:
+  case S8SUBQ:
+  case CMPULE:
+  case ADDLV:
+  case SUBLV:
+  case CMPLT:
+  case ADDQV:
+  case SUBQV:
+  case CMPLE:
+  case AND:
+  case BIC:
+  case CMOVLBS:
+  case CMOVLBC:
+  case BIS:
+  case CMOVEQ:
+  case CMOVNE:
+  case ORNOT:
+  case XOR:
+  case CMOVLT:
+  case CMOVGE:
+  case EQV:
+  case CMOVLE:
+  case CMOVGT:
+  case MSKBL:
+  case EXTBL:
+  case INSBL:
+  case MSKWL:
+  case EXTWL:
+  case INSWL:
+  case MSKLL:
+  case EXTLL:
+  case INSLL:
+  case ZAP:
+  case ZAPNOT:
+  case MSKQL:
+  case SRL:
+  case EXTQL:
+  case SLL:
+  case INSQL:
+  case SRA:
+  case MSKWH:
+  case INSWH:
+  case EXTWH:
+  case MSKLH:
+  case INSLH:
+  case EXTLH:
+  case MSKQH:
+  case INSQH:
+  case EXTQH:
+  case MULL:
+  case MULQ:
+  case UMULH:
+  case PERR:
+  case MINSB8:
+  case MINSW4:
+  case MINUB8:
+  case MINUW4:
+  case MAXUB8:
+  case MAXUW4:
+  case MAXSB8:
+  case MAXSW4:
+    my_regs->src1 = REG_INT;
+    my_regs->src2 = REG_INT;
+    my_regs->dest = REG_INT;
+    break;
+
+  case ADDLI:
+  case S4ADDLI:
+  case SUBLI:
+  case S4SUBLI:
+  case CMPBGEI:
+  case S8ADDLI:
+  case S8SUBLI:
+  case CMPULTI:
+  case ADDQI:
+  case S4ADDQI:
+  case SUBQI:
+  case S4SUBQI:
+  case CMPEQI:
+  case S8ADDQI:
+  case S8SUBQI:
+  case CMPULEI:
+  case ADDLVI:
+  case SUBLVI:
+  case CMPLTI:
+  case ADDQVI:
+  case SUBQVI:
+  case CMPLEI:
+  case ANDI:
+  case BICI:
+  case CMOVLBSI:
+  case CMOVLBCI:
+  case BISI:
+  case CMOVEQI:
+  case CMOVNEI:
+  case ORNOTI:
+  case XORI:
+  case CMOVLTI:
+  case CMOVGEI:
+  case EQVI:
+  case AMASK:
+  case CMOVLEI:
+  case CMOVGTI:
+  case MSKBLI:
+  case EXTBLI:
+  case INSBLI:
+  case MSKWLI:
+  case EXTWLI:
+  case INSWLI:
+  case MSKLLI:
+  case EXTLLI:
+  case INSLLI:
+  case ZAPI:
+  case ZAPNOTI:
+  case MSKQLI:
+  case SRLI:
+  case EXTQLI:
+  case SLLI:
+  case INSQLI:
+  case SRAI:
+  case MSKWHI:
+  case INSWHI:
+  case EXTWHI:
+  case MSKLHI:
+  case INSLHI:
+  case EXTLHI:
+  case MSKQHI:
+  case INSQHI:
+  case EXTQHI:
+  case MULLI:
+  case MULQI:
+  case UMULHI:
+  case JMP:
+  case JSR:
+  case RETN:
+  case JSR_COROUTINE:
+  case CTPOP:
+  case CTLZ:
+  case CTTZ:
+  case UNPKBW:
+  case UNPKBL:
+  case PKWB:
+  case PKLB:
+  case MINSB8I:
+  case MINSW4I:
+  case MINUB8I:
+  case MINUW4I:
+  case MAXUB8I:
+  case MAXUW4I:
+  case MAXSB8I:
+  case MAXSW4I:
+  case SEXTB:
+  case SEXTW:
+    my_regs->src1 = REG_INT;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_INT;
+    break;
+
+  case AMASKI:
+  case SEXTBI:
+  case SEXTWI:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_INT;
+    break;
+
+  case ITOFS:
+  case ITOFT:
+    my_regs->src1 = REG_INT;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_FP;
+    break;
+
+  case SQRTS:
+  case SQRTT:
+  case CVTTS:
+  case CVTTQ:
+  case CVTQS:
+  case CVTQT:
+  case CVTLQ:
+  case CVTQL:
+    my_regs->src1 = REG_FP;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_FP;
+    break;
+
+
+  case ADDS:
+  case SUBS:
+  case MULS:
+  case DIVS:
+  case ADDT:
+  case SUBT:
+  case MULT:
+  case DIVT:
+  case CMPTUN:
+  case CMPTEQ:
+  case CMPTLT:
+  case CMPTLE:
+  case CPYS:
+  case CPYSN:
+  case CPYSE:
+  case FCMOVEQ:
+  case FCMOVNE:
+  case FCMOVLT:
+  case FCMOVGE:
+  case FCMOVLE:
+  case FCMOVGT:
+    my_regs->src1 = REG_FP;
+    my_regs->src2 = REG_FP;
+    my_regs->dest = REG_FP;
+    break;
+
+
+  case FTOIT:
+  case FTOIS:
+    my_regs->src1 = REG_FP;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_INT;
+    break;
+
+  case MT_FPCR:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_FP;
+    break;
+
+
+  case PAL_RDUNIQ:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_INT;
+    break;
+  case PAL_WRUNIQ:
+    my_regs->src1 = REG_INT;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_NONE;
+    break;
+
+  default:
+    my_regs->src1 = REG_NONE;
+    my_regs->src2 = REG_NONE;
+    my_regs->dest = REG_NONE;
+    break;
+
+  }
+}
+/* marks an IQ entry type as free or allocated */
+enum iq_entry{
+  IQ_ENTRY_FREE = 0,  /* the entry is free */
+  IQ_ENTRY_ALLOC,     /* the entry is allocated */
+};
+
+/* actual IQ */
+static enum iq_entry *iq;
+
+/*
+ * Frees an issue queue entry
+ */
+static void free_iq_entry(int entry_num){
+  assert(entry_num >= 0);
+  assert(iq[entry_num] == IQ_ENTRY_ALLOC);
+  iq[entry_num] = IQ_ENTRY_FREE;
+}
+
+/*
+ * Locates the position of a free issue queue entry
+ */
+static int find_iq_entry(){
+  int i;
+  for(i=0;i < 4;i++){
+    if(iq[i] == IQ_ENTRY_FREE){
+      //we found an entry
+      return i;
+    }
+  }
+  //didn't find an entry
+  return -1;
+}
+
+/*
+ * Allocates an issue queue entry
+ */
+static int alloc_iq_entry(){
+  /* find the location of a free IQ entry */
+  int i = find_iq_entry();
+
+  /* if no free entry exists, return -1 */
+  if(i < 0){
+    return -1;
+  }
+
+  /* otherwise, mark the entry as allocated and return the entry number */
+  assert(iq[i] == IQ_ENTRY_FREE);
+  iq[i] = IQ_ENTRY_ALLOC;
+  return i;
+}
+
+/**********************************************/
+
 
 
 /* text-based stat profiles */
@@ -1492,18 +2025,16 @@ sim_load_prog(char *fname,		/* program to load */
 	      int argc, char **argv,	/* program arguments */
 	      char **envp)		/* program environment */
 {
-  struct regs_t* regs = &contexts[context_num].regs;
-
   init_context(&contexts[context_num],context_num);
 
   /* load program text and data, set up environment, memory, and regs */
-  ld_load_prog(fname, argc, argv, envp, regs, contexts[context_num].mem, TRUE);
+  ld_load_prog(fname, argc, argv, envp, &contexts[context_num].regs, contexts[context_num].mem, TRUE);
 
   /* initalize the PC */
-  regs->regs_PC = contexts[context_num].mem->ld_prog_entry;
-  regs->regs_NPC = contexts[context_num].mem->ld_prog_entry + 4;
+  contexts[context_num].regs.regs_PC = contexts[context_num].mem->ld_prog_entry;
+  contexts[context_num].regs.regs_NPC = contexts[context_num].mem->ld_prog_entry + 4;
   /* initalize the context_id */
-  regs->context_id = context_num;
+  contexts[context_num].regs.context_id = context_num;
 
   /* initialize here, so symbols can be loaded */
   if (ptrace_nelt == 2)
@@ -1618,6 +2149,17 @@ struct RUU_station {
      operands are known to be read (see lsq_refresh() for details on
      enforcing memory dependencies) */
   int idep_ready[MAX_IDEPS];		/* input operand ready? */
+
+  int in_IQ;
+  int context_id;
+  int disp_cycle;
+  int archreg;
+  int src_archreg[2];
+  int physreg;
+  int dest_format;
+  int old_physreg;
+  int src_physreg[2];
+  int iq_entry_num;
 };
 
 /* non-zero if all register operands are ready, update with MAX_IDEPS */
@@ -3797,57 +4339,66 @@ ruu_dispatch(void)
   int out1, out2, in1, in2, in3;	/* output/input register names */
   md_addr_t target_PC;			/* actual next/target PC address */
   md_addr_t addr;			/* effective address, if load/store */
-  struct RUU_station *rs;		/* RUU station being allocated */
-  struct RUU_station *lsq;		/* LSQ station for ld/st's */
+  struct RUU_station *rs;		        /* ROB entry being allocated */
+  struct RUU_station *lsq;		/* LSQ entry for ld/st's */
   struct bpred_update_t *dir_update_ptr;/* branch predictor dir update ptr */
   int stack_recover_idx;		/* bpred retstack recovery index */
   unsigned int pseq;			/* pipetrace sequence number */
   int is_write;				/* store? */
   int made_check;			/* used to ensure DLite entry */
   int br_taken, br_pred_taken;		/* if br, taken?  predicted taken? */
-  int fetch_redirected[10];
-  int fetch_stalled[10];
-  static disp_context_id = 0;
-  int spec_mode = contexts[disp_context_id].spec_mode;
+  int fetch_redirected[10];   /* indicates if fetch has been redirected for each thread
+					*  due to a branch for example */
+  int fetch_stalled[10];      /* indicates if fetch is stalled for each thread, due to
+					 * a branch, or Icache miss */
   byte_t temp_byte = 0;			/* temp variable for spec mem access */
   half_t temp_half = 0;			/* " ditto " */
   word_t temp_word = 0;			/* " ditto " */
 #ifdef HOST_HAS_QWORD
   qword_t temp_qword = 0;		/* " ditto " */
 #endif /* HOST_HAS_QWORD */
-  enum md_fault_type fault;
+  enum md_fault_type fault;             /* indicates if a fault has occured while decoding an instruction */
+  int bitmap_context_id = 0;            /* used for identifying the context in bitmap MACROS */
+  struct mem_t* mem;                    /* the memory space for the thread currently being examined */
+  struct regs_t* spec_regs;             /* the spec reg set for the thread currently being examined */
+  static int disp_context_id = 0;       /* the ID of the context currently being examined */
+  int spec_mode = contexts[disp_context_id].spec_mode; /* indicates if the current context is in speculative mode */
+  int my_iq_num = -1;                   /* the IQ entry allocated for this intruction */
+
 
   made_check = FALSE;
   n_dispatched = 0;
 
-  for (int i = 0; i < context_num; i++) {
-    fetch_redirected[i] = FALSE;
+  /* initalize variables */
+  for(i=0;i<10;i++){
+    fetch_redirected[i]=FALSE;
     fetch_stalled[i] = FALSE;
   }
 
-  disp_context_id = (disp_context_id + 1 ) % context_num;
-  spec_mode = contexts[disp_context_id].spec_mode;  
+  /* round robbin dispatch */
+  disp_context_id = (disp_context_id + 1) % context_num;
+
+  spec_mode = contexts[disp_context_id].spec_mode;
 
   while (/* instruction decode B/W left? */
-	 n_dispatched < (ruu_decode_width * fetch_speed)
-	 /* RUU and LSQ not full? */
-	 && contexts[disp_context_id].RUU_num < RUU_size && contexts[disp_context_id].LSQ_num < LSQ_size
+	 n_dispatched < (ruu_decode_width)
+	 /* ROB and LSQ not full? */
+	 && contexts[disp_context_id].RUU_num < RUU_size 
+	 && contexts[disp_context_id].LSQ_num < LSQ_size
 	 /* insts still available from fetch unit? */
 	 && contexts[disp_context_id].fetch_num != 0
 	 /* on an acceptable trace path */
-	 && (ruu_include_spec || !contexts[disp_context_id].spec_mode))
+	 && (!contexts[disp_context_id].spec_mode))
     {
-      /* if issuing in-order, block until last op issues if inorder issue */
-      if (ruu_inorder_issue
-	  && (last_op.rs && RSLINK_VALID(&last_op)
-	      && !OPERANDS_READY(last_op.rs)))
-	{
-  contexts[disp_context_id].icount--;
+
+      if(fetch_redirected[disp_context_id]){
+	/* consume instruction from IFETCH -> DISPATCH queue */
+	contexts[disp_context_id].icount--;
+	assert(contexts[disp_context_id].icount >= 0);
 	contexts[disp_context_id].fetch_head = (contexts[disp_context_id].fetch_head+1) & (ruu_ifq_size - 1);
 	contexts[disp_context_id].fetch_num--;
-	  /* stall until last operation is ready to issue */
-	  break;
-	}
+	continue;
+      }
 
       /* if fetch from the current thread is stalled, try to find a thread
        * that isn't stalled. If none exists, then stop dispatching
@@ -3878,25 +4429,52 @@ ruu_dispatch(void)
 	}
 
       /* get the next instruction from the IFETCH -> DISPATCH queue */
+      bitmap_context_id = disp_context_id;
+      mem = contexts[disp_context_id].mem;
+      spec_regs = &contexts[disp_context_id].spec_regs;
       inst = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].IR;
-      regs.regs_PC = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].regs_PC;
-      pred_PC = fetch_data[fetch_head].pred_PC;
+      contexts[disp_context_id].regs.regs_PC = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].regs_PC;
+      contexts[disp_context_id].pred_PC = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].pred_PC;
       dir_update_ptr = &(contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].dir_update);
       stack_recover_idx = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].stack_recover_idx;
       pseq = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].ptrace_seq;
       spec_mode = contexts[disp_context_id].spec_mode;
 
+
       /* decode the inst */
       MD_SET_OPCODE(op, inst);
 
-      /* compute default next PC */
-      regs.regs_NPC = regs.regs_PC + sizeof(md_inst_t);
+      {
+	struct reg_set my_regs;
+	get_reg_set(&my_regs, op);
+	/* make sure we have a free physical register for the destination */
+	if(my_regs.dest != REG_NONE){
+	  if(find_free_physreg(my_regs.dest) < 0){
+	    /* stall because there are no physical registers free */
+	    fetch_stalled[disp_context_id] = TRUE;
+	    continue;
+	  }
+	}
+      }
+      
+      /* if there are no available IQ slots, then block this thread */
+      my_iq_num = alloc_iq_entry();
+      if(my_iq_num < 0){
+	fetch_stalled[disp_context_id] = TRUE;
+	//  printf("#3\n");
+	continue;
+      }
 
-      /* drain RUU for TRAPs and system calls */
+      /* compute default next PC */
+      contexts[disp_context_id].regs.regs_NPC = contexts[disp_context_id].regs.regs_PC + sizeof(md_inst_t);
+
+      /* drain ROB for TRAPs and system calls */
       if (MD_OP_FLAGS(op) & F_TRAP)
 	{
-	  if (contexts[disp_context_id].RUU_num != 0)
+	  if (contexts[disp_context_id].RUU_num != 0){
+	    free_iq_entry(my_iq_num);
 	    break;
+	  }
 
 	  /* else, syscall is only instruction in the machine, at this
 	     point we should not be in (mis-)speculative mode */
@@ -3905,10 +4483,8 @@ ruu_dispatch(void)
 	}
 
       /* maintain $r0 semantics (in spec and non-spec space) */
-      regs.regs_R[MD_REG_ZERO] = 0; spec_regs_R[MD_REG_ZERO] = 0;
-#ifdef TARGET_ALPHA
-      regs.regs_F.d[MD_REG_ZERO] = 0.0; spec_regs_F.d[MD_REG_ZERO] = 0.0;
-#endif /* TARGET_ALPHA */
+      contexts[disp_context_id].regs.regs_R[MD_REG_ZERO] = 0; contexts[disp_context_id].regs.regs_R[MD_REG_ZERO] = 0;
+      contexts[disp_context_id].regs.regs_F.d[MD_REG_ZERO] = 0.0; contexts[disp_context_id].regs.regs_F.d[MD_REG_ZERO] = 0.0;
 
       if (!contexts[disp_context_id].spec_mode)
 	{
@@ -3918,7 +4494,6 @@ ruu_dispatch(void)
 
       /* default effective address (none) and access */
       addr = 0; is_write = FALSE;
-
       /* set default fault - none */
       fault = md_fault_none;
 
@@ -3950,7 +4525,7 @@ ruu_dispatch(void)
 	     the mis-speculated instruction paths */
 #define DECLARE_FAULT(FAULT)						\
 	  {								\
-	    if (!spec_mode)						\
+	    if (!contexts[disp_context_id].spec_mode)						\
 	      fault = (FAULT);						\
 	    /* else, spec fault, ignore it, always terminate exec... */	\
 	    break;							\
@@ -3970,22 +4545,23 @@ ruu_dispatch(void)
       if (!contexts[disp_context_id].spec_mode && verbose)
         {
           myfprintf(stderr, "++ %10n [xor: 0x%08x] {%d} @ 0x%08p: ",
-                    sim_num_insn, md_xor_regs(&regs),
-                    inst_seq+1, regs.regs_PC);
-          md_print_insn(inst, regs.regs_PC, stderr);
+                    sim_num_insn, md_xor_regs(&contexts[disp_context_id].regs),
+                    inst_seq+1, contexts[disp_context_id].regs.regs_PC);
+          md_print_insn(inst, contexts[disp_context_id].regs.regs_PC, stderr);
           fprintf(stderr, "\n");
           /* fflush(stderr); */
         }
 
-      if (fault != md_fault_none)
-	fatal("non-speculative fault (%d) detected @ 0x%08p",
-	      fault, regs.regs_PC);
-
+      if (fault != md_fault_none){
+	  fatal("non-speculative fault (%d) detected @ %d:0x%08p spec_mode: %d cxt.spec_mode %d",
+		fault, disp_context_id, contexts[disp_context_id].regs.regs_PC, spec_mode, contexts[disp_context_id].spec_mode);
+      }
+      
       /* update memory access stats */
       if (MD_OP_FLAGS(op) & F_MEM)
 	{
 	  sim_total_refs++;
-	  if (!spec_mode)
+	  if (!contexts[disp_context_id].spec_mode)
 	    sim_num_refs++;
 
 	  if (MD_OP_FLAGS(op) & F_STORE)
@@ -3998,72 +4574,58 @@ ruu_dispatch(void)
 	    }
 	}
 
-      br_taken = (regs.regs_NPC != (regs.regs_PC + sizeof(md_inst_t)));
-      br_pred_taken = (pred_PC != (regs.regs_PC + sizeof(md_inst_t)));
+      br_taken = (contexts[disp_context_id].regs.regs_NPC != (contexts[disp_context_id].regs.regs_PC + sizeof(md_inst_t)));
+      br_pred_taken = (contexts[disp_context_id].pred_PC != (contexts[disp_context_id].regs.regs_PC + sizeof(md_inst_t)));
 
-      /* Check for perfection prediction inconsistencies. */
-      if (pred_PC != regs.regs_NPC && pred_perfect)
-        {
-      	  pred_PC = regs.regs_NPC;
-	  fetch_pred_PC = fetch_regs_PC = regs.regs_NPC;
-	  fetch_head = (ruu_ifq_size-1);
-	  fetch_num = 1;
-	  fetch_tail = 0;
-	  fetch_redirected[disp_context_id] = TRUE;
-        }
-      /* Check for misfetch - we've predicted the branch taken, but our
-       * predicted target doesn't match the computed target.  Just update
-       * the PC values and do a fetch squash. */
-      else if ((MD_OP_FLAGS(op) & (F_CTRL|F_DIRJMP)) == (F_CTRL|F_DIRJMP) 
-	      && target_PC != pred_PC && br_pred_taken)
+      if ((contexts[disp_context_id].pred_PC != contexts[disp_context_id].regs.regs_NPC && pred_perfect)
+	  || ((MD_OP_FLAGS(op) & (F_CTRL|F_DIRJMP)) == (F_CTRL|F_DIRJMP)
+	      && target_PC != contexts[disp_context_id].pred_PC && br_pred_taken))
 	{
-          misfetch_count++;
-          recovery_count++;
+	  /* Either 1) we're simulating perfect prediction and are in a
+             mis-predict state and need to patch up, or 2) We're not simulating
+             perfect prediction, we've predicted the branch taken, but our
+             predicted target doesn't match the computed target (i.e.,
+             mis-fetch).  Just update the PC values and do a fetch squash.
+             This is just like calling fetch_squash() except we pre-anticipate
+             the updates to the fetch values at the end of this function.  If
+             case #2, also charge a mispredict penalty for redirecting fetch */
+	  contexts[disp_context_id].fetch_pred_PC = contexts[disp_context_id].fetch_regs_PC = 
+	    contexts[disp_context_id].regs.regs_NPC;
+	  if (pred_perfect)
+	    contexts[disp_context_id].pred_PC = contexts[disp_context_id].regs.regs_NPC;
 
-	  fetch_head = (ruu_ifq_size-1);
-	  fetch_num = 1;
-	  fetch_tail = 0;
-	  ruu_fetch_issue_delay += ruu_branch_penalty;
+	  if (!pred_perfect)
+	    contexts[disp_context_id].fetch_issue_delay = 3;
 
-          if (mf_compat) {
-	    fetch_pred_PC = fetch_regs_PC = regs.regs_NPC;
-	    fetch_redirected[disp_context_id] = TRUE;
-	    misfetch_only_count++;
-          }
-          else {
-	    fetch_pred_PC = fetch_regs_PC = target_PC;
-	    if (br_taken) {
-	      fetch_redirected[disp_context_id] = TRUE;
-	      misfetch_only_count++;
-	    }
-          }
+	  fetch_redirected[disp_context_id] = TRUE;
 	}
 
       /* is this a NOP */
       if (op != MD_NOP_OP)
 	{
 	  /* for load/stores:
-	       idep #0     - store operand (value that is store'ed)
-	       idep #1, #2 - eff addr computation inputs (addr of access)
+	         idep #0     - store operand (value that is store'ed)
+	         idep #1, #2 - eff addr computation inputs (addr of access)
 
-	     resulting RUU/LSQ operation pair:
-	       RUU (effective address computation operation):
+	     resulting ROB/LSQ operation pair:
+	       ROB (effective address computation operation):
 		 idep #0, #1 - eff addr computation inputs (addr of access)
 	       LSQ (memory access operation):
 		 idep #0     - operand input (value that is store'd)
-		 idep #1     - eff addr computation result (from RUU op)
+		 idep #1     - eff addr computation result (from ROB op)
 
 	     effective address computation is transfered via the reserved
 	     name DTMP
 	   */
 
-	  /* fill in RUU reservation station */
+	  
+	  /* fill in ROB entry */
 	  rs = &contexts[disp_context_id].RUU[contexts[disp_context_id].RUU_tail];
           rs->slip = sim_cycle - 1;
 	  rs->IR = inst;
 	  rs->op = op;
-	  rs->PC = regs.regs_PC;
-	  rs->next_PC = regs.regs_NPC; rs->pred_PC = pred_PC;
+	  rs->PC = contexts[disp_context_id].regs.regs_PC;
+	  rs->next_PC = contexts[disp_context_id].regs.regs_NPC; rs->pred_PC = contexts[disp_context_id].pred_PC;
 	  rs->in_LSQ = FALSE;
 	  rs->ea_comp = FALSE;
 	  rs->recover_inst = FALSE;
@@ -4073,23 +4635,58 @@ ruu_dispatch(void)
 	  rs->addr = 0;
 	  /* rs->tag is already set */
 	  rs->seq = ++inst_seq;
-	  rs->queued = rs->issued = rs->completed = FALSE;
+	  rs->in_IQ = rs->queued = rs->issued = rs->completed = FALSE;
 	  rs->ptrace_seq = pseq;
+	  rs->context_id = disp_context_id;
+	  rs->disp_cycle = sim_cycle;
+	  //store the architectural registers in the ROB entry
+	  rs->archreg = out1;
+	  rs->src_archreg[0] = in1;
+	  rs->src_archreg[1] = in2;
+	  //store the physical source registers
+	  rs->src_physreg[0] = contexts[disp_context_id].rename_table[in1];
+	  rs->src_physreg[1] = contexts[disp_context_id].rename_table[in2];
+	  if(out1 != 0)
+	  {
+	    /* Register renaming support */
+	    struct reg_set my_regs;
+	    get_reg_set(&my_regs, op);
+	    /* allocate and store the physical register for the destination */
+	    switch(my_regs.dest){
+	    case REG_NONE:
+	      rs->physreg = -1;
+	      rs->old_physreg = -1;
+	      break;
+	    case REG_INT:
+	    case REG_FP:
+	      rs->physreg = alloc_physreg(rs);
+	      break;
+	    }
+	    rs->dest_format = my_regs.dest;
+	  }else{
+	    /* DON'T RENAME REGISTER 0 */
+	    rs->physreg = -1;
+	    rs->old_physreg = -1;
+	  }
+
+	  /* insert into the issue queue */
+	  rs->iq_entry_num = my_iq_num;
+	  rs->in_IQ = TRUE;
 
 	  /* split ld/st's into two operations: eff addr comp + mem access */
 	  if (MD_OP_FLAGS(op) & F_MEM)
 	    {
-	      /* convert RUU operation from ld/st to an add (eff addr comp) */
+	      /* convert ROB operation from ld/st to an add (eff addr comp) */
 	      rs->op = MD_AGEN_OP;
 	      rs->ea_comp = TRUE;
 
-	      /* fill in LSQ reservation station */
+	      /* fill in LSQ entry */
 	      lsq = &contexts[disp_context_id].LSQ[contexts[disp_context_id].LSQ_tail];
               lsq->slip = sim_cycle - 1;
 	      lsq->IR = inst;
 	      lsq->op = op;
-	      lsq->PC = regs.regs_PC;
-	      lsq->next_PC = regs.regs_NPC; lsq->pred_PC = pred_PC;
+	      lsq->PC = contexts[disp_context_id].regs.regs_PC;
+	      lsq->next_PC = contexts[disp_context_id].regs.regs_NPC; lsq->pred_PC = contexts[disp_context_id].pred_PC;
 	      lsq->in_LSQ = TRUE;
 	      lsq->ea_comp = FALSE;
 	      lsq->recover_inst = FALSE;
@@ -4101,35 +4698,44 @@ ruu_dispatch(void)
 	      /* lsq->tag is already set */
 	      lsq->seq = ++inst_seq;
 	      lsq->queued = lsq->issued = lsq->completed = FALSE;
-	      lsq->ptrace_seq = pseq + 1;
+	      lsq->ptrace_seq = ptrace_seq++;
+	      lsq->context_id = disp_context_id;
+	      lsq->disp_cycle = 0;
+
+	      lsq->archreg = out1;
+	      lsq->src_archreg[0] = in1;
+	      lsq->src_archreg[1] = in2;
+	      lsq->physreg = rs->physreg;
+	      lsq->old_physreg = -1;//rs->old_physreg;
+	      lsq->dest_format = rs->dest_format;
 
 	      /* pipetrace this uop */
 	      ptrace_newuop(lsq->ptrace_seq, "internal ld/st", lsq->PC, 0);
 	      ptrace_newstage(lsq->ptrace_seq, PST_DISPATCH, 0);
 
 	      /* link eff addr computation onto operand's output chains */
-	      ruu_link_idep(rs, /* idep_ready[] index */0, NA);
-	      ruu_link_idep(rs, /* idep_ready[] index */1, in2);
-	      ruu_link_idep(rs, /* idep_ready[] index */2, in3);
+	      rob_link_idep(rs, /* idep_ready[] index */0, NA);
+	      rob_link_idep(rs, /* idep_ready[] index */1, in2);
+	      rob_link_idep(rs, /* idep_ready[] index */2, in3);
 
 	      /* install output after inputs to prevent self reference */
-	      ruu_install_odep(rs, /* odep_list[] index */0, DTMP);
-	      ruu_install_odep(rs, /* odep_list[] index */1, NA);
+	      rob_install_odep(rs, /* odep_list[] index */0, DTMP);
+	      rob_install_odep(rs, /* odep_list[] index */1, NA);
 
 	      /* link memory access onto output chain of eff addr operation */
-	      ruu_link_idep(lsq,
+	      rob_link_idep(lsq,
 			    /* idep_ready[] index */STORE_OP_INDEX/* 0 */,
 			    in1);
-	      ruu_link_idep(lsq,
+	      rob_link_idep(lsq,
 			    /* idep_ready[] index */STORE_ADDR_INDEX/* 1 */,
 			    DTMP);
-	      ruu_link_idep(lsq, /* idep_ready[] index */2, NA);
+	      rob_link_idep(lsq, /* idep_ready[] index */2, NA);
 
 	      /* install output after inputs to prevent self reference */
-	      ruu_install_odep(lsq, /* odep_list[] index */0, out1);
-	      ruu_install_odep(lsq, /* odep_list[] index */1, out2);
+	      rob_install_odep(lsq, /* odep_list[] index */0, out1);
+	      rob_install_odep(lsq, /* odep_list[] index */1, out2);
 
-	      /* install operation in the RUU and LSQ */
+	      /* install operation in the ROB and LSQ */
 	      n_dispatched++;
 	      contexts[disp_context_id].RUU_tail = (contexts[disp_context_id].RUU_tail + 1) % RUU_size;
 	      contexts[disp_context_id].RUU_num++;
@@ -4138,9 +4744,28 @@ ruu_dispatch(void)
 
 	      if (OPERANDS_READY(rs))
 		{
+
+#ifdef DYNAMIC_AF	
+		  regfile_total_pop_count_cycle += pop_count(rs->val_ra);
+		  regfile_total_pop_count_cycle += pop_count(rs->val_rb);
+		  regfile_num_pop_count_cycle+=2;
+#endif
+
 		  /* eff addr computation ready, queue it on ready list */
 		  readyq_enqueue(rs);
 		}
+
+	      else if (ONE_OPERANDS_READY(rs))
+		{
+#ifdef DYNAMIC_AF	
+		  if(rs->idep_ready[0])
+		    regfile_total_pop_count_cycle += pop_count(rs->val_ra);
+		  else
+		    regfile_total_pop_count_cycle += pop_count(rs->val_rb);
+		  regfile_num_pop_count_cycle++;
+#endif
+		}
+
 	      /* issue may continue when the load/store is issued */
 	      RSLINK_INIT(last_op, lsq);
 
@@ -4149,33 +4774,55 @@ ruu_dispatch(void)
 		  && OPERANDS_READY(lsq))
 		{
 		  /* panic("store immediately ready"); */
-		  /* put operation on ready list, ruu_issue() issue it later */
+		  /* put operation on ready list, issue() issue it later */
 		  readyq_enqueue(lsq);
 		}
 	    }
 	  else /* !(MD_OP_FLAGS(op) & F_MEM) */
 	    {
+	      /* Wattch: Regfile writes taken care of inside ruu_link_idep */
+
 	      /* link onto producing operation */
-	      ruu_link_idep(rs, /* idep_ready[] index */0, in1);
-	      ruu_link_idep(rs, /* idep_ready[] index */1, in2);
-	      ruu_link_idep(rs, /* idep_ready[] index */2, in3);
+	      rob_link_idep(rs, /* idep_ready[] index */0, in1);
+	      rob_link_idep(rs, /* idep_ready[] index */1, in2);
+	      rob_link_idep(rs, /* idep_ready[] index */2, in3);
 
 	      /* install output after inputs to prevent self reference */
-	      ruu_install_odep(rs, /* odep_list[] index */0, out1);
-	      ruu_install_odep(rs, /* odep_list[] index */1, out2);
+	      rob_install_odep(rs, /* odep_list[] index */0, out1);
+	      rob_install_odep(rs, /* odep_list[] index */1, out2);
 
-	      /* install operation in the RUU */
+	      /* install operation in the ROB */
 	      n_dispatched++;
 	      contexts[disp_context_id].RUU_tail = (contexts[disp_context_id].RUU_tail + 1) % RUU_size;
 	      contexts[disp_context_id].RUU_num++;
 
+
 	      /* issue op if all its reg operands are ready (no mem input) */
 	      if (OPERANDS_READY(rs))
 		{
-		  /* put operation on ready list, ruu_issue() issue it later */
+      #ifdef DYNAMIC_AF	
+		  regfile_total_pop_count_cycle += pop_count(rs->val_ra);
+		  regfile_total_pop_count_cycle += pop_count(rs->val_rb);
+		  regfile_num_pop_count_cycle+=2;
+#endif
+
+		  /* put operation on ready list, issue() issue it later */
 		  readyq_enqueue(rs);
 		  /* issue may continue */
 		  last_op = RSLINK_NULL;
+		}
+	      else if (ONE_OPERANDS_READY(rs))
+		{
+#ifdef DYNAMIC_AF	
+		  if(rs->idep_ready[0])
+		    regfile_total_pop_count_cycle += pop_count(rs->val_ra);
+		  else
+		    regfile_total_pop_count_cycle += pop_count(rs->val_rb);
+		  regfile_num_pop_count_cycle++;
+#endif
+
+		  /* could not issue this inst, stall issue until we can */
+		  RSLINK_INIT(last_op, rs);
 		}
 	      else
 		{
@@ -4186,7 +4833,9 @@ ruu_dispatch(void)
 	}
       else
 	{
-	  /* this is a NOP, no need to update RUU/LSQ state */
+	  /* this is a NOP, no need to update ROB/LSQ state */
+	  free_iq_entry(my_iq_num);
+	  contexts[disp_context_id].icount--;
 	  rs = NULL;
 	}
 
@@ -4197,11 +4846,6 @@ ruu_dispatch(void)
 
       if (!contexts[disp_context_id].spec_mode)
 	{
-#if 0 /* moved above for EIO trace file support */
-	  /* one more non-speculative instruction executed */
-	  sim_num_insn++;
-#endif
-
 	  /* if this is a branching instruction update BTB, i.e., only
 	     non-speculative state is committed into the BTB */
 	  if (MD_OP_FLAGS(op) & F_CTRL)
@@ -4209,32 +4853,32 @@ ruu_dispatch(void)
 	      sim_num_branches++;
 	      if (contexts[disp_context_id].pred && bpred_spec_update == spec_ID)
 		{
-		  bpred_update(pred,
-			       /* branch address */regs.regs_PC,
-			       /* actual target address */regs.regs_NPC,
-			       /* taken? */regs.regs_NPC != (regs.regs_PC +
+		  bpred_update(contexts[disp_context_id].pred,
+			       /* branch address */contexts[disp_context_id].regs.regs_PC,
+			       /* actual target address */contexts[disp_context_id].regs.regs_NPC,
+			       /* taken? */contexts[disp_context_id].regs.regs_NPC != (contexts[disp_context_id].regs.regs_PC +
 						       sizeof(md_inst_t)),
-			       /* pred taken? */pred_PC != (regs.regs_PC +
+			       /* pred taken? */contexts[disp_context_id].pred_PC != (contexts[disp_context_id].regs.regs_PC +
 							sizeof(md_inst_t)),
-			       /* correct pred? */pred_PC == regs.regs_NPC,
+			       /* correct pred? */contexts[disp_context_id].pred_PC == contexts[disp_context_id].regs.regs_NPC,
 			       /* opcode */op,
 			       /* predictor update ptr */&rs->dir_update);
 		}
 	    }
 
 	  /* is the trace generator trasitioning into mis-speculation mode? */
-	  if (pred_PC != regs.regs_NPC && !fetch_redirected)
+	  if (contexts[disp_context_id].pred_PC != contexts[disp_context_id].regs.regs_NPC)// && !fetch_redirected[disp_context_id])
 	    {
 	      /* entering mis-speculation mode, indicate this and save PC */
 	      contexts[disp_context_id].spec_mode = TRUE;
 	      rs->recover_inst = TRUE;
-	      recover_PC = regs.regs_NPC;
+	      contexts[disp_context_id].recover_PC = contexts[disp_context_id].regs.regs_NPC;
 	    }
 	}
 
       /* entered decode/allocate stage, indicate in pipe trace */
       ptrace_newstage(pseq, PST_DISPATCH,
-		      (pred_PC != regs.regs_NPC) ? PEV_MPOCCURED : 0);
+		      (contexts[disp_context_id].pred_PC != contexts[disp_context_id].regs.regs_NPC) ? PEV_MPOCCURED : 0);
       if (op == MD_NOP_OP)
 	{
 	  /* end of the line */
@@ -4252,7 +4896,7 @@ ruu_dispatch(void)
 	  delta = newval - pcstat_lastvals[i];
 	  if (delta != 0)
 	    {
-	      stat_add_samples(pcstat_sdists[i], regs.regs_PC, delta);
+	      stat_add_samples(pcstat_sdists[i], contexts[disp_context_id].regs.regs_PC, delta);
 	      pcstat_lastvals[i] = newval;
 	    }
 	}
@@ -4263,10 +4907,11 @@ ruu_dispatch(void)
 
       /* check for DLite debugger entry condition */
       made_check = TRUE;
-      if (dlite_check_break(pred_PC,
+      if (dlite_check_break(contexts[disp_context_id].pred_PC,
 			    is_write ? ACCESS_WRITE : ACCESS_READ,
 			    addr, sim_num_insn, sim_cycle))
-	dlite_main(regs.regs_PC, pred_PC, sim_cycle, &regs, mem);
+	dlite_main(contexts[disp_context_id].regs.regs_PC, contexts[disp_context_id].pred_PC, sim_cycle, &contexts[disp_context_id].regs, mem);
+
     }
 
   /* need to enter DLite at least once per cycle */
@@ -4275,24 +4920,19 @@ ruu_dispatch(void)
       if (dlite_check_break(/* no next PC */0,
 			    is_write ? ACCESS_WRITE : ACCESS_READ,
 			    addr, sim_num_insn, sim_cycle))
-	dlite_main(regs.regs_PC, /* no next PC */0, sim_cycle, &regs, contexts[disp_context_id].mem);
+	dlite_main(contexts[disp_context_id].regs.regs_PC, /* no next PC */0, sim_cycle, &contexts[disp_context_id].regs, contexts[disp_context_id].mem);
     }
+
 }
 
-
-/*
- *  RUU_FETCH() - instruction fetch pipeline stage(s)
- */
-
-/* initialize the instruction fetch pipeline stage */
 static void
 fetch_init(void)
 {
   int c = 0;
-  for(c=0; c < 10; c++){
+  for(c=0;c<10;c++){
     /* allocate the IFETCH -> DISPATCH instruction queue */
     contexts[c].fetch_data =
-      (struct fetch_rec *)calloc(4, sizeof(struct fetch_rec));
+      (struct fetch_rec *)calloc(ruu_ifq_size, sizeof(struct fetch_rec));
     if (! contexts[c].fetch_data)
       fatal("out of virtual memory");
     
@@ -4305,7 +4945,7 @@ fetch_init(void)
 
 /* dump contents of fetch stage registers and fetch queue */
 void
-fetch_dump(FILE *stream)			/* output stream */
+fetch_dump(FILE *stream, int context_id)       	/* output stream */
 {
   int num, head;
 
@@ -4314,31 +4954,32 @@ fetch_dump(FILE *stream)			/* output stream */
 
   fprintf(stream, "** fetch stage state **\n");
 
-  fprintf(stream, "spec_mode: %s\n", spec_mode ? "t" : "f");
+  fprintf(stream, "spec_mode: %s\n", contexts[context_id].spec_mode ? "t" : "f");
   myfprintf(stream, "pred_PC: 0x%08p, recover_PC: 0x%08p\n",
-	    pred_PC, recover_PC);
+	    contexts[context_id].pred_PC, contexts[context_id].recover_PC);
   myfprintf(stream, "fetch_regs_PC: 0x%08p, fetch_pred_PC: 0x%08p\n",
-	    fetch_regs_PC, fetch_pred_PC);
+	    contexts[context_id].fetch_regs_PC, contexts[context_id].fetch_pred_PC);
   fprintf(stream, "\n");
 
   fprintf(stream, "** fetch queue contents **\n");
-  fprintf(stream, "fetch_num: %d\n", fetch_num);
+  fprintf(stream, "fetch_num: %d\n", contexts[context_id].fetch_num);
   fprintf(stream, "fetch_head: %d, fetch_tail: %d\n",
-	  fetch_head, fetch_tail);
+	  contexts[context_id].fetch_head, contexts[context_id].fetch_tail);
 
-  num = fetch_num;
-  head = fetch_head;
+  num = contexts[context_id].fetch_num;
+  head = contexts[context_id].fetch_head;
   while (num)
     {
       fprintf(stream, "idx: %2d: inst: `", head);
-      md_print_insn(fetch_data[head].IR, fetch_data[head].regs_PC, stream);
+      md_print_insn(contexts[context_id].fetch_data[head].IR, contexts[context_id].fetch_data[head].regs_PC, stream);
       fprintf(stream, "'\n");
       myfprintf(stream, "         regs_PC: 0x%08p, pred_PC: 0x%08p\n",
-		fetch_data[head].regs_PC, fetch_data[head].pred_PC);
+		contexts[context_id].fetch_data[head].regs_PC, contexts[context_id].fetch_data[head].pred_PC);
       head = (head + 1) & (ruu_ifq_size - 1);
       num--;
     }
 }
+
 
 static int last_inst_missed = FALSE;
 static int last_inst_tmissed = FALSE;
@@ -4616,7 +5257,7 @@ simoo_mstate_obj(FILE *stream,			/* output stream */
   else if (!strcmp(cmd, "fetch"))
     {
       /* dump event queue contents */
-      fetch_dump(stream);
+      fetch_dump(stream, regs->context_id);
     }
   else
     return "unknown mstate command";
