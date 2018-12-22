@@ -4615,6 +4615,23 @@ void init_context(context* c, int c_id){
 
   }
 
+  /* allocate and initialize memory space */
+  sprintf(str,"mem_%d",c->id);
+  c->mem = mem_create(str);
+  mem_init(c->mem);
+  c->mem->ld_text_base = 0;
+  c->mem->ld_text_size = 0;
+  c->mem->ld_data_base = 0;
+  c->mem->ld_brk_point = 0;
+  c->mem->ld_data_size = 0;
+  c->mem->ld_stack_base = 0;
+  c->mem->ld_stack_size = 0;
+  c->mem->ld_stack_min = -1;
+  c->mem->ld_prog_fname = NULL;
+  c->mem->ld_prog_entry = 0;
+  c->mem->ld_environ_base = 0;
+  c->mem->ld_target_big_endian = 0;
+  c->mem->context_id = c_id;
   c->id = c_id;
   c->regs.context_id = c_id;
 

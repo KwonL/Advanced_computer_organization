@@ -83,6 +83,17 @@ struct mem_t {
   counter_t ptab_accesses;		/* total page table accesses */
 
   md_addr_t ld_prog_entry;
+  md_addr_t ld_text_base;
+  unsigned int ld_text_size;
+  md_addr_t ld_data_base;
+  md_addr_t ld_brk_point;
+  unsigned int ld_data_size;
+  md_addr_t ld_stack_base;
+  unsigned int ld_stack_size;
+  md_addr_t ld_stack_min;
+  char *ld_prog_fname;
+  md_addr_t ld_environ_base;
+  int ld_target_big_endian;
 };
 
 /* memory access command */
