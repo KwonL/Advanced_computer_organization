@@ -444,7 +444,7 @@ struct FMT_entry {
 };
 
 #ifndef FMT_MAX_NUM
-#define FMT_MAX_NUM 1000
+#define FMT_MAX_NUM 50
 #endif
 static struct FMT_entry FMT_table[FMT_MAX_NUM];
 static struct global_counter;
@@ -2467,7 +2467,6 @@ ruu_writeback(void)
       for (int i = 0; i < FMT_MAX_NUM; i++) {
         if (FMT_table[i].ROB_id == rs->ROB_id) {
           FMT_table[i].mispredict_bit = 1;
-          printf("This instruction! table num is %d, ROB id is %d\n", i, rs->ROB_id);
           break;
         }
       }
@@ -4019,7 +4018,7 @@ ruu_dispatch(void)
      * Modified for FMT
      * ROB allocated. Increase dispatch tail to here. 
      */
-    dispatch_tail++; 
+    dispatch_tail = (dispatch_tail + 1) % FMT_MAX_NUM;
     FMT_table[dispatch_tail].ROB_id = RUU_tail;
     rs->ROB_id = RUU_tail;
 
@@ -4401,7 +4400,6 @@ ruu_fetch(void)
          */
         fetch = (fetch + 1) % FMT_MAX_NUM;
         FMT_table[fetch] = zero_entry;
-        printf("Branch prediction fetched. entry is %d\n", fetch);
         /***********************************************/
 
 	      branch_cnt++;
