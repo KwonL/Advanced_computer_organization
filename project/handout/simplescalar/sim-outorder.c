@@ -430,6 +430,41 @@ mem_access_latency(int blk_sz)		/* block size accessed */
 	  (/* remainder chunk latency */mem_lat[1] * (chunks - 1)));
 }
 
+/*
+ * Modified for FMT
+ */
+
+struct FMT_entry {
+  int ROB_id;
+  int mispredict_bit;
+  int branch_penalty;
+  int local_L1_I_cache;
+  int local_L2_I_cache;
+  int local_I_TLB;
+};
+
+#ifndef FMT_MAX_NUM
+#define FMT_MAX_NUM 1000
+#endif
+static struct FMT_entry FMT_table[FMT_MAX_NUM];
+static struct global_counter;
+static unsigned int dispatch_head;
+static unsigned int dispatch_tail;
+static unsigned int fetch;
+static struct FMT_entry zero_entry = { 0 };
+
+
+static void init_FMT(void) {
+  for (int i = 0; i < FMT_MAX_NUM; i++) {
+    FMT_table[i] = zero_entry;
+  }
+  
+  dispatch_head = 0;
+  dispatch_tail = 0;
+  fetch = 0;
+}
+
+/****************************************************/
 
 /*
  * cache miss handlers
@@ -1544,6 +1579,12 @@ struct RUU_station {
      operands are known to be read (see lsq_refresh() for details on
      enforcing memory dependencies) */
   int idep_ready[MAX_IDEPS];		/* input operand ready? */
+
+      /* 
+     * Modified for FMT
+     */
+    unsigned int ROB_id;
+    /*************************************/
 };
 
 /* non-zero if all register operands are ready, update with MAX_IDEPS */
@@ -2417,6 +2458,22 @@ ruu_writeback(void)
       /* does this operation reveal a mis-predicted branch? */
       if (rs->recover_inst)
 	{
+    /* 
+     * Modified for FMT
+     * Branch mispredicted. set mispredict bit to corresponding entry in FMT.
+     */
+    {
+      // Search for entry
+      for (int i = 0; i < FMT_MAX_NUM; i++) {
+        if (FMT_table[i].ROB_id == rs->ROB_id) {
+          FMT_table[i].mispredict_bit = 1;
+          printf("This instruction! table num is %d, ROB id is %d\n", i, rs->ROB_id);
+          break;
+        }
+      }
+    }
+    /*************************************/
+    
 	  if (rs->in_LSQ)
 	    panic("mis-predicted load or store?!?!?");
 
@@ -3958,6 +4015,14 @@ ruu_dispatch(void)
 	  rs->queued = rs->issued = rs->completed = FALSE;
 	  rs->ptrace_seq = pseq;
 
+    /*
+     * Modified for FMT
+     * ROB allocated. Increase dispatch tail to here. 
+     */
+    dispatch_tail++; 
+    FMT_table[dispatch_tail].ROB_id = RUU_tail;
+    rs->ROB_id = RUU_tail;
+
 	  /* split ld/st's into two operations: eff addr comp + mem access */
 	  if (MD_OP_FLAGS(op) & F_MEM)
 	    {
@@ -4329,6 +4394,16 @@ ruu_fetch(void)
 	  else
 	    {
 	      /* go with target, NOTE: discontinuous fetch, so terminate */
+
+        /* 
+         * Modified for FMT 
+         * Branch instruction fetched! allocate FMT table entry
+         */
+        fetch = (fetch + 1) % FMT_MAX_NUM;
+        FMT_table[fetch] = zero_entry;
+        printf("Branch prediction fetched. entry is %d\n", fetch);
+        /***********************************************/
+
 	      branch_cnt++;
 	      if (branch_cnt >= fetch_speed)
 		done = TRUE;
