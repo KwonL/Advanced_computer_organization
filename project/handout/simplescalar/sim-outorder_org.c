@@ -84,39 +84,6 @@ typedef struct context_t {
   struct regs_t regs;
   struct mem_t* mem;
 
-  struct bpred_t* pred;
-  int pred_perfect;
-
-  int sim_num_insn;
-
-  long long fastfwd_count;
-  long long fastfwd_left;
-
-  int spec_mode;
-  struct regs_t spec_regs;
-
-  md_addr_t  fetch_regs_PC;
-  md_addr_t fetch_pred_PC;  
-
-  struct RUU_station* RUU;
-  int RUU_head, RUU_tail;
-  int RUU_num;
-
-  struct RUU_station* LSQ;
-  int LSQ_head, LSQ_tail;
-  int LSQ_num;
-
-  unsigned int ruu_fetch_issue_delay;
-
-  int fetch_num;
-
-  int rename_table[MD_TOTAL_REGS];
-
-  int id;
-  unsigned int fetch_issue_delay;
-  int icount;
-  int fetch_tail, fetch_head;
-  struct fetch_rec *fetch_data
 } context;
 
 /* simulated registers */
@@ -447,12 +414,6 @@ static struct bpred_t *pred;
 
 /* functional unit resource pool */
 static struct res_pool *fu_pool = NULL;
-
-/*
- * Modified for SMT
- * register renaming
- */
-
 
 /* text-based stat profiles */
 static struct stat_stat_t *pcstat_stats[MAX_PCSTAT_VARS];
@@ -962,23 +923,21 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
   if (fetch_speed < 1)
     fatal("front-end speed must be positive and non-zero");
 
-  {int i = 0;
-  for (i = 0; i < 10; i ++) {
   if (!mystricmp(pred_type, "perfect"))
     {
       /* perfect predictor */
-      contexts[i].pred = NULL;
-      contexts[i].pred_perfect = TRUE;
+      pred = NULL;
+      pred_perfect = TRUE;
     }
   else if (!mystricmp(pred_type, "taken"))
     {
       /* static predictor, not taken */
-      contexts[i].pred = bpred_create(BPredTaken, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      pred = bpred_create(BPredTaken, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
   else if (!mystricmp(pred_type, "nottaken"))
     {
       /* static predictor, taken */
-      contexts[i].pred = bpred_create(BPredNotTaken, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      pred = bpred_create(BPredNotTaken, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
   else if (!mystricmp(pred_type, "bimod"))
     {
@@ -989,7 +948,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
 	fatal("bad btb config (<num_sets> <associativity>)");
 
       /* bimodal predictor, bpred_create() checks BTB_SIZE */
-      contexts[i].pred = bpred_create(BPred2bit,
+      pred = bpred_create(BPred2bit,
 			  /* bimod table size */bimod_config[0],
 			  /* 2lev l1 size */0,
 			  /* 2lev l2 size */0,
@@ -1008,7 +967,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
       if (btb_nelt != 2)
 	fatal("bad btb config (<num_sets> <associativity>)");
 
-      contexts[i].pred = bpred_create(BPred2Level,
+      pred = bpred_create(BPred2Level,
 			  /* bimod table size */0,
 			  /* 2lev l1 size */twolev_config[0],
 			  /* 2lev l2 size */twolev_config[1],
@@ -1031,7 +990,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
       if (btb_nelt != 2)
 	fatal("bad btb config (<num_sets> <associativity>)");
 
-      contexts[i].pred = bpred_create(BPredComb,
+      pred = bpred_create(BPredComb,
 			  /* bimod table size */bimod_config[0],
 			  /* l1 size */twolev_config[0],
 			  /* l2 size */twolev_config[1],
@@ -1044,8 +1003,6 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
     }
   else
     fatal("cannot parse predictor type `%s'", pred_type);
-  }
-  }
 
   if (!bpred_spec_opt)
     bpred_spec_update = spec_CT;
@@ -1268,12 +1225,6 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_counter(sdb, "sim_num_refs",
 		   "total number of loads and stores committed",
 		   &sim_num_refs, 0, NULL);
-  for (i = 0; i < context_num; i++) { 
-    char str[30]; 
-    sprintf(str, "sim_num_insn for THREAD %d", i);
-    stat_reg_counter(sdb, str, "total number of instructions committed for this thread",
-        &contexts[i].sim_num_insn, 0, NULL);
-  }
   stat_reg_counter(sdb, "sim_num_loads",
 		   "total number of loads committed",
 		   &sim_num_loads, 0, NULL);
@@ -1492,18 +1443,8 @@ sim_load_prog(char *fname,		/* program to load */
 	      int argc, char **argv,	/* program arguments */
 	      char **envp)		/* program environment */
 {
-  struct regs_t* regs = &contexts[context_num].regs;
-
-  init_context(&contexts[context_num],context_num);
-
   /* load program text and data, set up environment, memory, and regs */
-  ld_load_prog(fname, argc, argv, envp, regs, contexts[context_num].mem, TRUE);
-
-  /* initalize the PC */
-  regs->regs_PC = contexts[context_num].mem->ld_prog_entry;
-  regs->regs_NPC = contexts[context_num].mem->ld_prog_entry + 4;
-  /* initalize the context_id */
-  regs->context_id = context_num;
+  ld_load_prog(fname, argc, argv, envp, &regs, mem, TRUE);
 
   /* initialize here, so symbols can be loaded */
   if (ptrace_nelt == 2)
@@ -1531,8 +1472,6 @@ sim_load_prog(char *fname,		/* program to load */
 
   /* initialize the DLite debugger */
   dlite_init(simoo_reg_obj, simoo_mem_obj, simoo_mstate_obj);
-
-  context_num++;
 }
 
 /* dump simulator-specific auxiliary simulator statistics */
@@ -2225,15 +2164,15 @@ cv_dump(FILE *stream)				/* output stream */
    RUU and LSQ to the architected reg file, stores in the LSQ will commit
    their store data to the data cache at this point as well */
 static void
-ruu_commit(int context_id)
+ruu_commit(void)
 {
   int i, lat, events, committed = 0;
   static counter_t sim_ret_insn = 0;
 
   /* all values must be retired to the architected reg file in program order */
-  while (contexts[context_id].RUU_num > 0 && committed < ruu_commit_width)
+  while (RUU_num > 0 && committed < ruu_commit_width)
     {
-      struct RUU_station *rs = &(contexts[context_id].RUU[contexts[context_id].RUU_head]);
+      struct RUU_station *rs = &(RUU[RUU_head]);
 
       if (!rs->completed)
 	{
@@ -2245,20 +2184,20 @@ ruu_commit(int context_id)
       events = 0;
 
       /* load/stores must retire load/store queue entry as well */
-      if (contexts[context_id].RUU[contexts[context_id].RUU_head].ea_comp)
+      if (RUU[RUU_head].ea_comp)
 	{
 	  /* load/store, retire head of LSQ as well */
-	  if (contexts[context_id].LSQ_num <= 0 || !contexts[context_id].LSQ[contexts[context_id].LSQ_head].in_LSQ)
+	  if (LSQ_num <= 0 || !LSQ[LSQ_head].in_LSQ)
 	    panic("RUU out of sync with LSQ");
 
 	  /* load/store operation must be complete */
-	  if (!contexts[context_id].LSQ[contexts[context_id].LSQ_head].completed)
+	  if (!LSQ[LSQ_head].completed)
 	    {
 	      /* load/store operation is not yet complete */
 	      break;
 	    }
 
-	  if ((MD_OP_FLAGS(contexts[context_id].LSQ[contexts[context_id].LSQ_head].op) & (F_MEM|F_STORE))
+	  if ((MD_OP_FLAGS(LSQ[LSQ_head].op) & (F_MEM|F_STORE))
 	      == (F_MEM|F_STORE))
 	    {
 	      struct res_template *fu;
@@ -2266,7 +2205,7 @@ ruu_commit(int context_id)
 
 	      /* stores must retire their store value to the cache at commit,
 		 try to get a store port (functional unit allocation) */
-	      fu = res_get(fu_pool, MD_OP_FUCLASS(contexts[context_id].LSQ[contexts[context_id].LSQ_head].op));
+	      fu = res_get(fu_pool, MD_OP_FUCLASS(LSQ[LSQ_head].op));
 	      if (fu)
 		{
 		  /* reserve the functional unit */
@@ -2281,7 +2220,7 @@ ruu_commit(int context_id)
 		    {
 		      /* commit store value to D-cache */
 		      lat =
-			cache_access(cache_dl1, Write, (contexts[context_id].LSQ[contexts[context_id].LSQ_head].addr&~3),
+			cache_access(cache_dl1, Write, (LSQ[LSQ_head].addr&~3),
 				     NULL, 4, sim_cycle, NULL, NULL);
 		      if (lat > cache_dl1_lat)
 			events |= PEV_CACHEMISS;
@@ -2292,7 +2231,7 @@ ruu_commit(int context_id)
 		    {
 		      /* access the D-TLB */
 		      lat =
-			cache_access(dtlb, Read, (contexts[context_id].LSQ[contexts[context_id].LSQ_head].addr & ~3),
+			cache_access(dtlb, Read, (LSQ[LSQ_head].addr & ~3),
 				     NULL, 4, sim_cycle, NULL, NULL);
 		      if (lat > 1)
 			events |= PEV_TLBMISS;
@@ -2306,23 +2245,23 @@ ruu_commit(int context_id)
 	    }
 
 	  /* invalidate load/store operation instance */
-	  contexts[context_id].LSQ[contexts[context_id].LSQ_head].tag++;
-          sim_slip += (sim_cycle - contexts[context_id].LSQ[contexts[context_id].LSQ_head].slip);
+	  LSQ[LSQ_head].tag++;
+          sim_slip += (sim_cycle - LSQ[LSQ_head].slip);
    
 	  /* indicate to pipeline trace that this instruction retired */
-	  ptrace_newstage(contexts[context_id].LSQ[contexts[context_id].LSQ_head].ptrace_seq, PST_COMMIT, events);
-	  ptrace_endinst(contexts[context_id].LSQ[contexts[context_id].LSQ_head].ptrace_seq);
+	  ptrace_newstage(LSQ[LSQ_head].ptrace_seq, PST_COMMIT, events);
+	  ptrace_endinst(LSQ[LSQ_head].ptrace_seq);
 
 	  /* commit head of LSQ as well */
-	  contexts[context_id].LSQ_head = (contexts[context_id].LSQ_head + 1) % LSQ_size;
-	  contexts[context_id].LSQ_num--;
+	  LSQ_head = (LSQ_head + 1) % LSQ_size;
+	  LSQ_num--;
 	}
 
-      if (contexts[context_id].pred
+      if (pred
 	  && bpred_spec_update == spec_CT
 	  && (MD_OP_FLAGS(rs->op) & F_CTRL))
 	{
-	  bpred_update(contexts[context_id].pred,
+	  bpred_update(pred,
 		       /* branch address */rs->PC,
 		       /* actual target address */rs->next_PC,
                        /* taken? */rs->next_PC != (rs->PC +
@@ -2335,27 +2274,27 @@ ruu_commit(int context_id)
 	}
 
       /* invalidate RUU operation instance */
-      contexts[context_id].RUU[contexts[context_id].RUU_head].tag++;
-      sim_slip += (sim_cycle - contexts[context_id].RUU[contexts[context_id].RUU_head].slip);
+      RUU[RUU_head].tag++;
+      sim_slip += (sim_cycle - RUU[RUU_head].slip);
       /* print retirement trace if in verbose mode */
       if (verbose)
 	{
 	  sim_ret_insn++;
-	  myfprintf(stderr, "%10n @ 0x%08p: ", sim_ret_insn, contexts[context_id].RUU[contexts[context_id].RUU_head].PC);
- 	  md_print_insn(contexts[context_id].RUU[contexts[context_id].RUU_head].IR, contexts[context_id].RUU[contexts[context_id].RUU_head].PC, stderr);
-	  if (MD_OP_FLAGS(contexts[context_id].RUU[contexts[context_id].RUU_head].op) & F_MEM)
-	    myfprintf(stderr, "  mem: 0x%08p", contexts[context_id].RUU[contexts[context_id].RUU_head].addr);
+	  myfprintf(stderr, "%10n @ 0x%08p: ", sim_ret_insn, RUU[RUU_head].PC);
+ 	  md_print_insn(RUU[RUU_head].IR, RUU[RUU_head].PC, stderr);
+	  if (MD_OP_FLAGS(RUU[RUU_head].op) & F_MEM)
+	    myfprintf(stderr, "  mem: 0x%08p", RUU[RUU_head].addr);
 	  fprintf(stderr, "\n");
 	  /* fflush(stderr); */
 	}
 
       /* indicate to pipeline trace that this instruction retired */
-      ptrace_newstage(contexts[context_id].RUU[contexts[context_id].RUU_head].ptrace_seq, PST_COMMIT, events);
-      ptrace_endinst(contexts[context_id].RUU[contexts[context_id].RUU_head].ptrace_seq);
+      ptrace_newstage(RUU[RUU_head].ptrace_seq, PST_COMMIT, events);
+      ptrace_endinst(RUU[RUU_head].ptrace_seq);
 
       /* commit head entry of RUU */
-      contexts[context_id].RUU_head = (contexts[context_id].RUU_head + 1) % RUU_size;
-      contexts[context_id].RUU_num--;
+      RUU_head = (RUU_head + 1) % RUU_size;
+      RUU_num--;
 
       /* one more instruction committed to architected state */
       committed++;
@@ -2624,7 +2563,7 @@ ruu_writeback(void)
    unknown address) */
 #define MAX_STD_UNKNOWNS		64
 static void
-lsq_refresh(int context_id)
+lsq_refresh(void)
 {
   int i, j, index, n_std_unknowns;
   md_addr_t std_unknowns[MAX_STD_UNKNOWNS];
@@ -2632,23 +2571,23 @@ lsq_refresh(int context_id)
   /* scan entire queue for ready loads: scan from oldest instruction
      (head) until we reach the tail or an unresolved store, after which no
      other instruction will become ready */
-  for (i=0, index=contexts[context_id].LSQ_head, n_std_unknowns=0;
-       i < contexts[context_id].LSQ_num;
+  for (i=0, index=LSQ_head, n_std_unknowns=0;
+       i < LSQ_num;
        i++, index=(index + 1) % LSQ_size)
     {
       /* terminate search for ready loads after first unresolved store,
 	 as no later load could be resolved in its presence */
       if (/* store? */
-	  (MD_OP_FLAGS(contexts[context_id].LSQ[index].op) & (F_MEM|F_STORE)) == (F_MEM|F_STORE))
+	  (MD_OP_FLAGS(LSQ[index].op) & (F_MEM|F_STORE)) == (F_MEM|F_STORE))
 	{
-	  if (!STORE_ADDR_READY(&contexts[context_id].LSQ[index]) && !perfect_disambig)
+	  if (!STORE_ADDR_READY(&LSQ[index]) && !perfect_disambig)
 	    {
 	      /* FIXME: a later STD + STD known could hide the STA unknown */
 	      /* STA unknown, blocks all later loads, stop search */
 	      break;
 	    }
-	  else if (!OPERANDS_READY(&contexts[context_id].LSQ[index]) ||
-	    (!STORE_ADDR_READY(&contexts[context_id].LSQ[index]) && perfect_disambig))
+	  else if (!OPERANDS_READY(&LSQ[index]) ||
+	    (!STORE_ADDR_READY(&LSQ[index]) && perfect_disambig))
 	    {
 	      /* STA known, but STD unknown: may block a later store, record
 		 this address for later referral, we use an array here because
@@ -2657,38 +2596,38 @@ lsq_refresh(int context_id)
 		 not ready, treat this in the same manner as a STD unknown. */
 	      if (n_std_unknowns == MAX_STD_UNKNOWNS)
 		fatal("STD unknown array overflow, increase MAX_STD_UNKNOWNS");
-	      std_unknowns[n_std_unknowns++] = contexts[context_id].LSQ[index].addr;
+	      std_unknowns[n_std_unknowns++] = LSQ[index].addr;
 	    }
 	  else /* STORE_ADDR_READY() && OPERANDS_READY() */
 	    {
 	      /* a later STD known hides an earlier STD unknown */
 	      for (j=0; j<n_std_unknowns; j++)
 		{
-		  if (std_unknowns[j] == /* STA/STD known */contexts[context_id].LSQ[index].addr)
+		  if (std_unknowns[j] == /* STA/STD known */LSQ[index].addr)
 		    std_unknowns[j] = /* bogus addr */0;
 		}
 	    }
 	}
 
       if (/* load? */
-	  ((MD_OP_FLAGS(contexts[context_id].LSQ[index].op) & (F_MEM|F_LOAD)) == (F_MEM|F_LOAD))
-	  && /* queued? */!contexts[context_id].LSQ[index].queued
-	  && /* waiting? */!contexts[context_id].LSQ[index].issued
-	  && /* completed? */!contexts[context_id].LSQ[index].completed
-	  && /* regs ready? */OPERANDS_READY(&contexts[context_id].LSQ[index]))
+	  ((MD_OP_FLAGS(LSQ[index].op) & (F_MEM|F_LOAD)) == (F_MEM|F_LOAD))
+	  && /* queued? */!LSQ[index].queued
+	  && /* waiting? */!LSQ[index].issued
+	  && /* completed? */!LSQ[index].completed
+	  && /* regs ready? */OPERANDS_READY(&LSQ[index]))
 	{
 	  /* no STA unknown conflict (because we got to this check), check for
 	     a STD unknown conflict */
 	  for (j=0; j<n_std_unknowns; j++)
 	    {
 	      /* found a relevant STD unknown? */
-	      if (std_unknowns[j] == contexts[context_id].LSQ[index].addr)
+	      if (std_unknowns[j] == LSQ[index].addr)
 		break;
 	    }
 	  if (j == n_std_unknowns)
-	      /* no STA or STD unknown conflicts, put load on ready queue */
 	    {
-	      readyq_enqueue(&contexts[context_id].LSQ[index]);
+	      /* no STA or STD unknown conflicts, put load on ready queue */
+	      readyq_enqueue(&LSQ[index]);
 	    }
 	}
     }
@@ -3805,10 +3744,7 @@ ruu_dispatch(void)
   int is_write;				/* store? */
   int made_check;			/* used to ensure DLite entry */
   int br_taken, br_pred_taken;		/* if br, taken?  predicted taken? */
-  int fetch_redirected[10];
-  int fetch_stalled[10];
-  static disp_context_id = 0;
-  int spec_mode = contexts[disp_context_id].spec_mode;
+  int fetch_redirected = FALSE;
   byte_t temp_byte = 0;			/* temp variable for spec mem access */
   half_t temp_half = 0;			/* " ditto " */
   word_t temp_word = 0;			/* " ditto " */
@@ -3819,58 +3755,18 @@ ruu_dispatch(void)
 
   made_check = FALSE;
   n_dispatched = 0;
-
-  for (int i = 0; i < context_num; i++) {
-    fetch_redirected[i] = FALSE;
-    fetch_stalled[i] = FALSE;
-  }
-
-  disp_context_id = (disp_context_id + 1 ) % context_num;
-  spec_mode = contexts[disp_context_id].spec_mode;  
-
   while (/* instruction decode B/W left? */
 	 n_dispatched < (ruu_decode_width * fetch_speed)
 	 /* RUU and LSQ not full? */
-	 && contexts[disp_context_id].RUU_num < RUU_size && contexts[disp_context_id].LSQ_num < LSQ_size
+	 && RUU_num < RUU_size && LSQ_num < LSQ_size
 	 /* insts still available from fetch unit? */
-	 && contexts[disp_context_id].fetch_num != 0
+	 && fetch_num != 0
 	 /* on an acceptable trace path */
-	 && (ruu_include_spec || !contexts[disp_context_id].spec_mode))
+	 && (ruu_include_spec || !spec_mode))
     {
       /* if issuing in-order, block until last op issues if inorder issue */
       if (ruu_inorder_issue
 	  && (last_op.rs && RSLINK_VALID(&last_op)
-	      && !OPERANDS_READY(last_op.rs)))
-	{
-  contexts[disp_context_id].icount--;
-	contexts[disp_context_id].fetch_head = (contexts[disp_context_id].fetch_head+1) & (ruu_ifq_size - 1);
-	contexts[disp_context_id].fetch_num--;
-	  /* stall until last operation is ready to issue */
-	  break;
-	}
-
-      /* if fetch from the current thread is stalled, try to find a thread
-       * that isn't stalled. If none exists, then stop dispatching
-       */
-      if(fetch_stalled[disp_context_id]){
-	int j;
-	int all_stalled = 1;
-	for(j = 0; j<context_num; j++){
-	  if(!fetch_stalled[j])
-	    all_stalled = 0;
-	}
-
-	if(all_stalled == 1){
-	  break;
-	}
-	else{
-	  disp_context_id = (disp_context_id + 1) % context_num;
-	  continue;
-	}
-      }
-
-      /* if issuing in-order, block until last op issues if inorder issue */
-      if ((last_op.rs && RSLINK_VALID(&last_op)
 	      && !OPERANDS_READY(last_op.rs)))
 	{
 	  /* stall until last operation is ready to issue */
@@ -3878,13 +3774,12 @@ ruu_dispatch(void)
 	}
 
       /* get the next instruction from the IFETCH -> DISPATCH queue */
-      inst = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].IR;
-      regs.regs_PC = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].regs_PC;
+      inst = fetch_data[fetch_head].IR;
+      regs.regs_PC = fetch_data[fetch_head].regs_PC;
       pred_PC = fetch_data[fetch_head].pred_PC;
-      dir_update_ptr = &(contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].dir_update);
-      stack_recover_idx = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].stack_recover_idx;
-      pseq = contexts[disp_context_id].fetch_data[contexts[disp_context_id].fetch_head].ptrace_seq;
-      spec_mode = contexts[disp_context_id].spec_mode;
+      dir_update_ptr = &(fetch_data[fetch_head].dir_update);
+      stack_recover_idx = fetch_data[fetch_head].stack_recover_idx;
+      pseq = fetch_data[fetch_head].ptrace_seq;
 
       /* decode the inst */
       MD_SET_OPCODE(op, inst);
@@ -3895,12 +3790,12 @@ ruu_dispatch(void)
       /* drain RUU for TRAPs and system calls */
       if (MD_OP_FLAGS(op) & F_TRAP)
 	{
-	  if (contexts[disp_context_id].RUU_num != 0)
+	  if (RUU_num != 0)
 	    break;
 
 	  /* else, syscall is only instruction in the machine, at this
 	     point we should not be in (mis-)speculative mode */
-	  if (contexts[disp_context_id].spec_mode)
+	  if (spec_mode)
 	    panic("drained and speculative");
 	}
 
@@ -3910,7 +3805,7 @@ ruu_dispatch(void)
       regs.regs_F.d[MD_REG_ZERO] = 0.0; spec_regs_F.d[MD_REG_ZERO] = 0.0;
 #endif /* TARGET_ALPHA */
 
-      if (!contexts[disp_context_id].spec_mode)
+      if (!spec_mode)
 	{
 	  /* one more non-speculative instruction executed */
 	  sim_num_insn++;
@@ -3967,7 +3862,7 @@ ruu_dispatch(void)
       /* operation sets next PC */
 
       /* print retirement trace if in verbose mode */
-      if (!contexts[disp_context_id].spec_mode && verbose)
+      if (!spec_mode && verbose)
         {
           myfprintf(stderr, "++ %10n [xor: 0x%08x] {%d} @ 0x%08p: ",
                     sim_num_insn, md_xor_regs(&regs),
@@ -3993,7 +3888,7 @@ ruu_dispatch(void)
 	  else
 	    {
 	      sim_total_loads++;
-	      if (!contexts[disp_context_id].spec_mode)
+	      if (!spec_mode)
 		sim_num_loads++;
 	    }
 	}
@@ -4009,7 +3904,7 @@ ruu_dispatch(void)
 	  fetch_head = (ruu_ifq_size-1);
 	  fetch_num = 1;
 	  fetch_tail = 0;
-	  fetch_redirected[disp_context_id] = TRUE;
+	  fetch_redirected = TRUE;
         }
       /* Check for misfetch - we've predicted the branch taken, but our
        * predicted target doesn't match the computed target.  Just update
@@ -4027,13 +3922,13 @@ ruu_dispatch(void)
 
           if (mf_compat) {
 	    fetch_pred_PC = fetch_regs_PC = regs.regs_NPC;
-	    fetch_redirected[disp_context_id] = TRUE;
+	    fetch_redirected = TRUE;
 	    misfetch_only_count++;
           }
           else {
 	    fetch_pred_PC = fetch_regs_PC = target_PC;
 	    if (br_taken) {
-	      fetch_redirected[disp_context_id] = TRUE;
+	      fetch_redirected = TRUE;
 	      misfetch_only_count++;
 	    }
           }
@@ -4058,7 +3953,7 @@ ruu_dispatch(void)
 	   */
 
 	  /* fill in RUU reservation station */
-	  rs = &contexts[disp_context_id].RUU[contexts[disp_context_id].RUU_tail];
+	  rs = &RUU[RUU_tail];
           rs->slip = sim_cycle - 1;
 	  rs->IR = inst;
 	  rs->op = op;
@@ -4069,7 +3964,7 @@ ruu_dispatch(void)
 	  rs->recover_inst = FALSE;
           rs->dir_update = *dir_update_ptr;
 	  rs->stack_recover_idx = stack_recover_idx;
-	  rs->spec_mode = contexts[disp_context_id].spec_mode;
+	  rs->spec_mode = spec_mode;
 	  rs->addr = 0;
 	  /* rs->tag is already set */
 	  rs->seq = ++inst_seq;
@@ -4084,7 +3979,7 @@ ruu_dispatch(void)
 	      rs->ea_comp = TRUE;
 
 	      /* fill in LSQ reservation station */
-	      lsq = &contexts[disp_context_id].LSQ[contexts[disp_context_id].LSQ_tail];
+	      lsq = &LSQ[LSQ_tail];
               lsq->slip = sim_cycle - 1;
 	      lsq->IR = inst;
 	      lsq->op = op;
@@ -4096,7 +3991,7 @@ ruu_dispatch(void)
 	      lsq->dir_update.pdir1 = lsq->dir_update.pdir2 = NULL;
 	      lsq->dir_update.pmeta = NULL;
 	      lsq->stack_recover_idx = 0;
-	      lsq->spec_mode = contexts[disp_context_id].spec_mode;
+	      lsq->spec_mode = spec_mode;
 	      lsq->addr = addr;
 	      /* lsq->tag is already set */
 	      lsq->seq = ++inst_seq;
@@ -4131,10 +4026,10 @@ ruu_dispatch(void)
 
 	      /* install operation in the RUU and LSQ */
 	      n_dispatched++;
-	      contexts[disp_context_id].RUU_tail = (contexts[disp_context_id].RUU_tail + 1) % RUU_size;
-	      contexts[disp_context_id].RUU_num++;
-	      contexts[disp_context_id].LSQ_tail = (contexts[disp_context_id].LSQ_tail + 1) % LSQ_size;
-	      contexts[disp_context_id].LSQ_num++;
+	      RUU_tail = (RUU_tail + 1) % RUU_size;
+	      RUU_num++;
+	      LSQ_tail = (LSQ_tail + 1) % LSQ_size;
+	      LSQ_num++;
 
 	      if (OPERANDS_READY(rs))
 		{
@@ -4166,8 +4061,8 @@ ruu_dispatch(void)
 
 	      /* install operation in the RUU */
 	      n_dispatched++;
-	      contexts[disp_context_id].RUU_tail = (contexts[disp_context_id].RUU_tail + 1) % RUU_size;
-	      contexts[disp_context_id].RUU_num++;
+	      RUU_tail = (RUU_tail + 1) % RUU_size;
+	      RUU_num++;
 
 	      /* issue op if all its reg operands are ready (no mem input) */
 	      if (OPERANDS_READY(rs))
@@ -4195,7 +4090,7 @@ ruu_dispatch(void)
       if (MD_OP_FLAGS(op) & F_CTRL)
 	sim_total_branches++;
 
-      if (!contexts[disp_context_id].spec_mode)
+      if (!spec_mode)
 	{
 #if 0 /* moved above for EIO trace file support */
 	  /* one more non-speculative instruction executed */
@@ -4207,7 +4102,7 @@ ruu_dispatch(void)
 	  if (MD_OP_FLAGS(op) & F_CTRL)
 	    {
 	      sim_num_branches++;
-	      if (contexts[disp_context_id].pred && bpred_spec_update == spec_ID)
+	      if (pred && bpred_spec_update == spec_ID)
 		{
 		  bpred_update(pred,
 			       /* branch address */regs.regs_PC,
@@ -4226,7 +4121,7 @@ ruu_dispatch(void)
 	  if (pred_PC != regs.regs_NPC && !fetch_redirected)
 	    {
 	      /* entering mis-speculation mode, indicate this and save PC */
-	      contexts[disp_context_id].spec_mode = TRUE;
+	      spec_mode = TRUE;
 	      rs->recover_inst = TRUE;
 	      recover_PC = regs.regs_NPC;
 	    }
@@ -4258,8 +4153,8 @@ ruu_dispatch(void)
 	}
 
       /* consume instruction from IFETCH -> DISPATCH queue */
-      contexts[disp_context_id].fetch_head = (contexts[disp_context_id].fetch_head+1) & (ruu_ifq_size - 1);
-      contexts[disp_context_id].fetch_num--;
+      fetch_head = (fetch_head+1) & (ruu_ifq_size - 1);
+      fetch_num--;
 
       /* check for DLite debugger entry condition */
       made_check = TRUE;
@@ -4275,7 +4170,7 @@ ruu_dispatch(void)
       if (dlite_check_break(/* no next PC */0,
 			    is_write ? ACCESS_WRITE : ACCESS_READ,
 			    addr, sim_num_insn, sim_cycle))
-	dlite_main(regs.regs_PC, /* no next PC */0, sim_cycle, &regs, contexts[disp_context_id].mem);
+	dlite_main(regs.regs_PC, /* no next PC */0, sim_cycle, &regs, mem);
     }
 }
 
@@ -4288,19 +4183,16 @@ ruu_dispatch(void)
 static void
 fetch_init(void)
 {
-  int c = 0;
-  for(c=0; c < 10; c++){
-    /* allocate the IFETCH -> DISPATCH instruction queue */
-    contexts[c].fetch_data =
-      (struct fetch_rec *)calloc(4, sizeof(struct fetch_rec));
-    if (! contexts[c].fetch_data)
-      fatal("out of virtual memory");
-    
-    contexts[c].fetch_num = 0;
-    contexts[c].fetch_tail =  contexts[c].fetch_head = 0;
-    IFQ_count = 0;
-    IFQ_fcount = 0;
-  }
+  /* allocate the IFETCH -> DISPATCH instruction queue */
+  fetch_data =
+    (struct fetch_rec *)calloc(ruu_ifq_size, sizeof(struct fetch_rec));
+  if (!fetch_data)
+    fatal("out of virtual memory");
+
+  fetch_num = 0;
+  fetch_tail = fetch_head = 0;
+  IFQ_count = 0;
+  IFQ_fcount = 0;
 }
 
 /* dump contents of fetch stage registers and fetch queue */
@@ -4570,63 +4462,6 @@ simoo_mstate_obj(FILE *stream,			/* output stream */
   return NULL;
 }
 
-/*
- * Modified for SMT
- */
-
-int ff_left() {
-  int id = 0;
-  int i;
-
-  for (i = 0; i < context_num; i++) {
-    if (contexts[i].fastfwd_left > contexts[id].fastfwd_left)
-      id = i;
-  }
-
-  if (contexts[id].fastfwd_left == 0) {
-    return -1;
-  }
-
-  return id;
-}
-
-
-void init_context(context* c, int c_id){
-  char str[20];
-
-  /* allocate and initialize register file */
-  regs_init(&c->regs);
-  regs_init(&c->spec_regs);
-
-  c->regs.context_id = c_id;
-
-  c->spec_mode = FALSE;
-
-
-  {
-    int i;
-    for(i=0; i<32; i++){
-      c->rename_table[i] = i + c_id*32;
-    }
-    for(i=32; i<64; i++){
-      //floating point portion of the rename table
-      c->rename_table[i] = (i-32) + c_id*32;
-    }
-
-  }
-
-  c->id = c_id;
-  c->regs.context_id = c_id;
-
-  c->fetch_issue_delay = 0;
-  c->icount = 0;
-  c->sim_num_insn = 0;
-
-}
-
-
-/***********************/
-
 
 /* start simulation, program loaded, processor precise state initialized */
 void
@@ -4639,21 +4474,14 @@ sim_main(void)
   /* set up program entry state */
   regs.regs_PC = ld_prog_entry;
   regs.regs_NPC = regs.regs_PC + sizeof(md_inst_t);
-  
-  int cur_context = context_num - 1;
 
   /* check for DLite debugger entry condition */
-  if (dlite_check_break(contexts[0].regs.regs_PC, /* no access */0, /* addr */0, 0, 0))
-    dlite_main(contexts[0].regs.regs_PC, regs.regs_PC + sizeof(md_inst_t),
-	       sim_cycle, &contexts[0].regs, mem);
+  if (dlite_check_break(regs.regs_PC, /* no access */0, /* addr */0, 0, 0))
+    dlite_main(regs.regs_PC, regs.regs_PC + sizeof(md_inst_t),
+	       sim_cycle, &regs, mem);
 
   /* fast forward simulator loop, performs functional simulation for
      FASTFWD_COUNT insts, then turns on performance (timing) simulation */
-
-  for (int i = 0; i < context_num; i++) {
-    contexts[i].fastfwd_left = fastfwd_count;
-  }
-
   if (fastfwd_count > 0)
     {
       int icount;
@@ -4669,26 +4497,19 @@ sim_main(void)
       qword_t temp_qword = 0;		/* " ditto " */
 #endif /* HOST_HAS_QWORD */
       enum md_fault_type fault;
-      int cur_context = 0;
 
       fprintf(stderr, "sim: ** fast forwarding %d insts **\n", fastfwd_count);
 
-    while((cur_context = ff_left()) >= 0)
+      for (icount=0; icount < fastfwd_count; icount++)
 	{
-    struct mem_t* mem = contexts[cur_context].mem;
-	  struct regs_t* spec_regs = &contexts[cur_context].spec_regs;
-	  int spec_mode = contexts[cur_context].spec_mode;
-	  int bitmap_context_id = cur_context;
-	  
-
 	  /* maintain $r0 semantics */
-	  contexts[cur_context].regs.regs_R[MD_REG_ZERO] = 0;
+	  regs.regs_R[MD_REG_ZERO] = 0;
 #ifdef TARGET_ALPHA
-	  contexts[cur_context].regs.regs_F.d[MD_REG_ZERO] = 0.0;
+	  regs.regs_F.d[MD_REG_ZERO] = 0.0;
 #endif /* TARGET_ALPHA */
 
 	  /* get the next instruction to execute */
-	  MD_FETCH_INST(inst, mem, contexts[cur_context].regs.regs_PC);
+	  MD_FETCH_INST(inst, mem, regs.regs_PC);
 
 	  /* set default reference address */
 	  addr = 0; is_write = FALSE;
@@ -4720,7 +4541,7 @@ sim_main(void)
 	    }
 
 	  if (fault != md_fault_none)
-	    fatal("fault (%d) detected @ 0x%08p", fault, contexts[cur_context].regs.regs_PC);
+	    fatal("fault (%d) detected @ 0x%08p", fault, regs.regs_PC);
 
 	  /* update memory access stats */
 	  if (MD_OP_FLAGS(op) & F_MEM)
@@ -4730,53 +4551,44 @@ sim_main(void)
 	    }
 
 	  /* check for DLite debugger entry condition */
-	  if (dlite_check_break(contexts[cur_context].regs.regs_NPC,
+	  if (dlite_check_break(regs.regs_NPC,
 				is_write ? ACCESS_WRITE : ACCESS_READ,
 				addr, sim_num_insn, sim_num_insn))
-	    dlite_main(contexts[cur_context].regs.regs_PC, contexts[cur_context].regs.regs_NPC, sim_num_insn, &contexts[cur_context].regs, mem);
+	    dlite_main(regs.regs_PC, regs.regs_NPC, sim_num_insn, &regs, mem);
 
 	  /* go to the next instruction */
-	  contexts[cur_context].regs.regs_PC = contexts[cur_context].regs.regs_NPC;
-	  contexts[cur_context].regs.regs_NPC += sizeof(md_inst_t);
-
-    contexts[cur_context].fastfwd_left--;
-
+	  regs.regs_PC = regs.regs_NPC;
+	  regs.regs_NPC += sizeof(md_inst_t);
 	}
     }
 
-  /* set up timing simulation entry state */
-  for (int i = 0; i < context_num; i++) {
-    contexts[i].fetch_regs_PC = contexts[i].regs.regs_PC;
-    contexts[i].fetch_pred_PC = contexts[i].regs.regs_PC;
-    contexts[i].regs.regs_PC = contexts[i].regs.regs_PC;
-  }
-
   fprintf(stderr, "sim: ** starting performance simulation **\n");
+
+  /* set up timing simulation entry state */
+  fetch_regs_PC = regs.regs_PC - sizeof(md_inst_t);
+  fetch_pred_PC = regs.regs_PC;
+  regs.regs_PC = regs.regs_PC - sizeof(md_inst_t);
 
   /* main simulator loop, NOTE: the pipe stages are traverse in reverse order
      to eliminate this/next state synchronization and relaxation problems */
   for (;;)
     {
-      for (int i = 0; i < context_num; i++) {
-        /* RUU/LSQ sanity checks */
-        if (contexts[i].RUU_num < contexts[i].LSQ_num)
-    panic("RUU_num < LSQ_num");
-        if (((contexts[i].RUU_head + contexts[i].RUU_num) % RUU_size) != contexts[i].RUU_tail)
-    panic("RUU_head/RUU_tail wedged");
-        if (((contexts[i].LSQ_head + contexts[i].LSQ_num) % LSQ_size) != contexts[i].LSQ_tail)
-    panic("LSQ_head/LSQ_tail wedged");
-      }
+      /* RUU/LSQ sanity checks */
+      if (RUU_num < LSQ_num)
+	panic("RUU_num < LSQ_num");
+      if (((RUU_head + RUU_num) % RUU_size) != RUU_tail)
+	panic("RUU_head/RUU_tail wedged");
+      if (((LSQ_head + LSQ_num) % LSQ_size) != LSQ_tail)
+	panic("LSQ_head/LSQ_tail wedged");
 
       /* check if pipetracing is still active */
-      ptrace_check_active(contexts[cur_context].regs.regs_PC, sim_num_insn, sim_cycle);
+      ptrace_check_active(regs.regs_PC, sim_num_insn, sim_cycle);
 
       /* indicate new cycle in pipetrace */
       ptrace_newcycle(sim_cycle);
 
       /* commit entries from RUU/LSQ to architected register file */
-      for (int i = 0; i < context_num; i++) {
-        ruu_commit(i);
-      }
+      ruu_commit();
 
       /* service function unit release events */
       ruu_release_fu();
@@ -4791,8 +4603,7 @@ sim_main(void)
 	{
 	  /* try to locate memory operations that are ready to execute */
 	  /* ==> inserts operations into ready queue --> mem deps resolved */
-    for (int i = 0; i < context_num; i++)
-	    lsq_refresh(i);
+	  lsq_refresh();
 
 	  /* issue operations ready to execute from a previous cycle */
 	  /* <== drains ready queue <-- ready operations commence execution */
@@ -4807,8 +4618,7 @@ sim_main(void)
 	{
 	  /* try to locate memory operations that are ready to execute */
 	  /* ==> inserts operations into ready queue --> mem deps resolved */
-    for (int i = 0; i < context_num; i++)
-	    lsq_refresh(i);
+	  lsq_refresh();
 
 	  /* issue operations ready to execute from a previous cycle */
 	  /* <== drains ready queue <-- ready operations commence execution */
@@ -4818,36 +4628,23 @@ sim_main(void)
       /* call instruction fetch unit if it is not blocked */
       if (!ruu_fetch_issue_delay)
 	ruu_fetch();
-      else {
-        for (int i = 0; i < context_num; i++) 
-	        contexts[i].ruu_fetch_issue_delay--;
-      }
+      else
+	ruu_fetch_issue_delay--;
 
       /* update buffer occupancy stats */
-      for (int i = 0; i < context_num; i++) {
-        IFQ_count += contexts[i].fetch_num;
-        IFQ_fcount += ((contexts[i].fetch_num == ruu_ifq_size) ? 1 : 0);
-        RUU_count += contexts[i].RUU_num;
-        RUU_fcount += ((contexts[i].RUU_num == RUU_size) ? 1 : 0);
-        LSQ_count += contexts[i].LSQ_num;
-        LSQ_fcount += ((contexts[i].LSQ_num == LSQ_size) ? 1 : 0);
-      }
+      IFQ_count += fetch_num;
+      IFQ_fcount += ((fetch_num == ruu_ifq_size) ? 1 : 0);
+      RUU_count += RUU_num;
+      RUU_fcount += ((RUU_num == RUU_size) ? 1 : 0);
+      LSQ_count += LSQ_num;
+      LSQ_fcount += ((LSQ_num == LSQ_size) ? 1 : 0);
 
       /* go to next cycle */
       sim_cycle++;
 
       /* finish early? */
-    {
-    int i;
-    int done = 1;
-    for(i=0;i<context_num;i++){
-      done = 0;
-      if(!max_insts || contexts[i].sim_num_insn >= max_insts)
-        return;
-    }
-    if(done)
-      return;
-    
-    }
+      if (max_insts && sim_num_insn >= max_insts)
+	return;
+      if (program_complete) return;
     }
 }
