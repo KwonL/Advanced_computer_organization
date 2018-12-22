@@ -4346,33 +4346,85 @@ static int last_inst_tmissed = FALSE;
 /* fetch up as many instruction as one branch prediction and one cache line
    acess will support without overflowing the IFETCH -> DISPATCH QUEUE */
 static void
-ruu_fetch(void)
+ruu_fetch(int* current_fetch_context_ptr)
 {
-  int i, lat, tlb_lat, done = FALSE;
+  int i, lat, tlb_lat;
+  int done[10];
   md_inst_t inst;
   int stack_recover_idx;
-  int branch_cnt;
-  enum md_opcode op;
+  int branch_cnt[10];
+  int current_fetch_context = current_fetch_context_ptr[0];
 
-  for (i=0, branch_cnt=0;
+  for(i=0;i<10;i++){
+    branch_cnt[i] = 0;
+    done[i] = FALSE;
+  }
+
+  for (i=0;
        /* fetch up to as many instruction as the DISPATCH stage can decode */
        i < (ruu_decode_width * fetch_speed)
        /* fetch until IFETCH -> DISPATCH queue fills */
-       && fetch_num < ruu_ifq_size
+       && contexts[current_fetch_context].fetch_num < ruu_ifq_size;
        /* and no IFETCH blocking condition encountered */
-       && !done;
        i++)
     {
+
+      /* stop fetching if we reach a branch */
+      if (branch_cnt[current_fetch_context] > 0){
+	if(current_fetch_context == current_fetch_context_ptr[0]){
+	  current_fetch_context = current_fetch_context_ptr[1];
+	  if (branch_cnt[current_fetch_context]){
+	    return;
+	  }
+	}
+	else
+	  return;
+	i--;
+	continue;
+      }
+
+      if (done[current_fetch_context] > 0){
+	if(current_fetch_context == current_fetch_context_ptr[0]){
+	  current_fetch_context = current_fetch_context_ptr[1];
+	  if (done[current_fetch_context])
+	    return;
+	}
+	else{
+	  return;
+	}
+	i--;
+	continue;
+      }
+      
+      /* enforce the fetch-issue delay counters for each thread
+       * these counters are used for modeling the minimum branch misprediction
+       * penalty.
+       */
+      if (contexts[current_fetch_context].fetch_issue_delay > 0){
+	if(current_fetch_context == current_fetch_context_ptr[0]){
+	  current_fetch_context = current_fetch_context_ptr[1];
+	  if (contexts[current_fetch_context].fetch_issue_delay > 0){
+	    return;
+	  }
+	}
+	else{
+	  return;
+	}
+	i--;
+	continue;
+      }
+      
+      struct mem_t* mem = contexts[current_fetch_context].mem;
       /* fetch an instruction at the next predicted fetch address */
-      fetch_regs_PC = fetch_pred_PC;
+      contexts[current_fetch_context].fetch_regs_PC = contexts[current_fetch_context].fetch_pred_PC;
 
       /* is this a bogus text address? (can happen on mis-spec path) */
-      if (1 || ld_text_base <= fetch_regs_PC
-	  && fetch_regs_PC < (ld_text_base+ld_text_size)
-	  && !(fetch_regs_PC & (sizeof(md_inst_t)-1)))
+      if (mem->ld_text_base <= contexts[current_fetch_context].fetch_regs_PC
+	  && contexts[current_fetch_context].fetch_regs_PC < (mem->ld_text_base+mem->ld_text_size)
+	  && !(contexts[current_fetch_context].fetch_regs_PC & (sizeof(md_inst_t)-1)))
 	{
 	  /* read instruction from memory */
-	  MD_FETCH_INST(inst, mem, fetch_regs_PC);
+	  MD_FETCH_INST(inst, mem, contexts[current_fetch_context].fetch_regs_PC);
 
 	  /* address is within program text, read instruction from memory */
 	  lat = cache_il1_lat;
@@ -4380,9 +4432,9 @@ ruu_fetch(void)
 	    {
 	      /* access the I-cache */
 	      lat =
-		cache_access(cache_il1, Read, IACOMPRESS(fetch_regs_PC),
-			     NULL, ISCOMPRESS(sizeof(md_inst_t)), sim_cycle,
-			     NULL, NULL);
+		cache_access(cache_il1, Read, IACOMPRESS(contexts[current_fetch_context].fetch_regs_PC),
+			     current_fetch_context, NULL, ISCOMPRESS(sizeof(md_inst_t)), sim_cycle,
+			     NULL);
 	      if (lat > cache_il1_lat)
 		last_inst_missed = TRUE;
 	    }
@@ -4392,22 +4444,21 @@ ruu_fetch(void)
 	      /* access the I-TLB, NOTE: this code will initiate
 		 speculative TLB misses */
 	      tlb_lat =
-		cache_access(itlb, Read, IACOMPRESS(fetch_regs_PC),
-			     NULL, ISCOMPRESS(sizeof(md_inst_t)), sim_cycle,
-			     NULL, NULL);
+		cache_access(itlb, Read, IACOMPRESS(contexts[current_fetch_context].fetch_regs_PC),
+			     current_fetch_context, NULL, ISCOMPRESS(sizeof(md_inst_t)), sim_cycle,
+			     NULL);
 	      if (tlb_lat > 1)
 		last_inst_tmissed = TRUE;
 
 	      /* I-cache/I-TLB accesses occur in parallel */
 	      lat = MAX(tlb_lat, lat);
 	    }
-
+	  
 	  /* I-cache/I-TLB miss? assumes I-cache hit >= I-TLB hit */
 	  if (lat != cache_il1_lat)
 	    {
 	      /* I-cache miss, block fetch until it is resolved */
-	      ruu_fetch_issue_delay += lat - 1;
-	      break;
+	      contexts[current_fetch_context].fetch_issue_delay += lat - 1;
 	    }
 	  /* else, I-cache/I-TLB hit */
 	}
@@ -4419,73 +4470,77 @@ ruu_fetch(void)
 
       /* have a valid inst, here */
 
-      /* pre-decode instruction */
-      MD_SET_OPCODE(op, inst);
-
       /* possibly use the BTB target */
-      if (pred)
+      if (contexts[current_fetch_context].pred)
 	{
+	  enum md_opcode op;
+
+	  /* pre-decode instruction, used for bpred stats recording */
+	  MD_SET_OPCODE(op, inst);
+	  
 	  /* get the next predicted fetch address; only use branch predictor
 	     result for branches (assumes pre-decode bits); NOTE: returned
 	     value may be 1 if bpred can only predict a direction */
 	  if (MD_OP_FLAGS(op) & F_CTRL)
-	    fetch_pred_PC =
-	      bpred_lookup(pred,
-			   /* branch address */fetch_regs_PC,
+	    contexts[current_fetch_context].fetch_pred_PC =
+	      bpred_lookup(contexts[current_fetch_context].pred,
+			   /* branch address */contexts[current_fetch_context].fetch_regs_PC,
 			   /* target address *//* FIXME: not computed */0,
 			   /* opcode */op,
 			   /* call? */MD_IS_CALL(op),
 			   /* return? */MD_IS_RETURN(op),
-			   /* updt */&(fetch_data[fetch_tail].dir_update),
+			   /* updt */&(contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].dir_update),
 			   /* RSB index */&stack_recover_idx);
 	  else
-	    fetch_pred_PC = 0;
+	    contexts[current_fetch_context].fetch_pred_PC = 0;
 
 	  /* valid address returned from branch predictor? */
-	  if (!fetch_pred_PC)
+	  if (!contexts[current_fetch_context].fetch_pred_PC)
 	    {
 	      /* no predicted taken target, attempt not taken target */
-	      fetch_pred_PC = fetch_regs_PC + sizeof(md_inst_t);
+	      contexts[current_fetch_context].fetch_pred_PC = contexts[current_fetch_context].fetch_regs_PC + sizeof(md_inst_t);
 	    }
 	  else
 	    {
 	      /* go with target, NOTE: discontinuous fetch, so terminate */
-	      branch_cnt++;
-	      if (branch_cnt >= fetch_speed)
-		done = TRUE;
+	      branch_cnt[current_fetch_context]++;
+	      //if (branch_cnt[current_fetch_context] >= fetch_speed)
+	      done[current_fetch_context] = TRUE;
 	    }
 	}
       else
 	{
 	  /* no predictor, just default to predict not taken, and
 	     continue fetching instructions linearly */
-	  fetch_pred_PC = fetch_regs_PC + sizeof(md_inst_t);
+	  contexts[current_fetch_context].fetch_pred_PC = contexts[current_fetch_context].fetch_regs_PC + sizeof(md_inst_t);
 	}
 
       /* commit this instruction to the IFETCH -> DISPATCH queue */
-      fetch_data[fetch_tail].IR = inst;
-      fetch_data[fetch_tail].regs_PC = fetch_regs_PC;
-      fetch_data[fetch_tail].pred_PC = fetch_pred_PC;
-      fetch_data[fetch_tail].stack_recover_idx = stack_recover_idx;
-      fetch_data[fetch_tail].ptrace_seq = ptrace_seq++;
+      contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].IR = inst;
+      contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].regs_PC = contexts[current_fetch_context].fetch_regs_PC;
+      contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].pred_PC = contexts[current_fetch_context].fetch_pred_PC;
+      contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].stack_recover_idx = stack_recover_idx;
+      contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].ptrace_seq = ptrace_seq++;
 
       /* for pipe trace */
-      ptrace_newinst(fetch_data[fetch_tail].ptrace_seq,
-		     inst, fetch_data[fetch_tail].regs_PC,
+      ptrace_newinst(contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].ptrace_seq,
+		     inst, contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].regs_PC,
 		     0);
-      ptrace_newstage(fetch_data[fetch_tail].ptrace_seq,
+      ptrace_newstage(contexts[current_fetch_context].fetch_data[contexts[current_fetch_context].fetch_tail].ptrace_seq,
 		      PST_IFETCH,
 		      ((last_inst_missed ? PEV_CACHEMISS : 0)
 		       | (last_inst_tmissed ? PEV_TLBMISS : 0)));
       last_inst_missed = FALSE;
       last_inst_tmissed = FALSE;
 
-      /* allocate an additional ptrace_seq for internal ld/st uop */
-      if (MD_OP_FLAGS(op) & F_MEM) ptrace_seq++;
-      
       /* adjust instruction fetch queue */
-      fetch_tail = (fetch_tail + 1) & (ruu_ifq_size - 1);
-      fetch_num++;
+      contexts[current_fetch_context].fetch_tail = (contexts[current_fetch_context].fetch_tail + 1) & (ruu_ifq_size - 1);
+      contexts[current_fetch_context].fetch_num++;
+      contexts[current_fetch_context].icount++;
+
+      /* fetch half from first thread, half from second... */
+      if(i == (ruu_decode_width * fetch_speed)/2)
+	current_fetch_context = current_fetch_context_ptr[1]; 
     }
 }
 
@@ -4639,6 +4694,26 @@ void init_context(context* c, int c_id){
   c->icount = 0;
   c->sim_num_insn = 0;
 
+}
+
+int my_comparator(const void * a1, const void * a2){
+  return (contexts[*(int*)a1].icount - contexts[*(int*)a2].icount);
+}
+
+static void icount_fetch(void){
+  int i;
+  int sorted_contexts[10];
+
+  for(i=0;i<context_num;i++){
+    sorted_contexts[i]= i;
+  }
+  for(i=context_num; i<10; i++)
+    sorted_contexts[i] = context_num - 1;
+
+  qsort(&sorted_contexts, context_num, sizeof(int), &my_comparator);
+
+  //fetch instructions
+  ruu_fetch(sorted_contexts);
 }
 
 
@@ -4834,7 +4909,7 @@ sim_main(void)
 
       /* call instruction fetch unit if it is not blocked */
       if (!ruu_fetch_issue_delay)
-	ruu_fetch();
+	icount_fetch();
       else {
         for (int i = 0; i < context_num; i++) 
 	        contexts[i].ruu_fetch_issue_delay--;
