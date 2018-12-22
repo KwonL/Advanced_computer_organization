@@ -94,6 +94,7 @@ struct mem_t {
   char *ld_prog_fname;
   md_addr_t ld_environ_base;
   int ld_target_big_endian;
+  int context_id;
 };
 
 /* memory access command */
