@@ -80,6 +80,7 @@
  * pipeline operations.
  */
 
+static int bmiss = 0;
 /* simulated registers */
 static struct regs_t regs;
 
@@ -444,22 +445,22 @@ struct FMT_entry {
 };
 
 #ifndef FMT_MAX_NUM
-#define FMT_MAX_NUM 50
+#define FMT_MAX_NUM 3000
 #endif
 static struct FMT_entry FMT_table[FMT_MAX_NUM];
-static struct global_counter;
+static struct FMT_entry global_counter = { 0 };
 static unsigned int dispatch_head;
 static unsigned int dispatch_tail;
 static unsigned int fetch;
 static struct FMT_entry zero_entry = { 0 };
 
-
 static void init_FMT(void) {
+  zero_entry.ROB_id = -1;
   for (int i = 0; i < FMT_MAX_NUM; i++) {
     FMT_table[i] = zero_entry;
   }
   
-  dispatch_head = 0;
+  dispatch_head = 1;
   dispatch_tail = 0;
   fetch = 0;
 }
@@ -539,6 +540,14 @@ if (cache_il2)
       /* access next level of inst cache hierarchy */
       lat = cache_access(cache_il2, cmd, baddr, NULL, bsize,
 			 /* now */now, /* pudata */NULL, /* repl addr */NULL);
+
+      /* 
+      * Modified for FMT
+      * Miss at I-L2 cache. 
+      */
+      FMT_table[fetch].local_L1_I_cache = lat;
+      /*************************************/
+
       if (cmd == Read)
 	return lat;
       else
@@ -2320,6 +2329,33 @@ ruu_commit(void)
       ptrace_newstage(RUU[RUU_head].ptrace_seq, PST_COMMIT, events);
       ptrace_endinst(RUU[RUU_head].ptrace_seq);
 
+      /* 
+      * Modified for FMT
+      */
+     {
+       for (int i = 0; i < FMT_MAX_NUM; i++) {
+        if (FMT_table[i].ROB_id == RUU_head && i == dispatch_head) {
+          dispatch_head = (dispatch_head + 1) % FMT_MAX_NUM;
+
+          /* branch miss penalty will evaluated in other place */
+          if (!FMT_table[i].mispredict_bit) {
+            global_counter.local_L1_I_cache += FMT_table[i].local_L1_I_cache;
+            global_counter.local_L2_I_cache += FMT_table[i].local_L2_I_cache;
+            global_counter.local_I_TLB += FMT_table[i].local_I_TLB;
+          }
+
+          if (dispatch_head >= (dispatch_tail + 1) % FMT_MAX_NUM) {
+            dispatch_tail = dispatch_head;
+            fetch = dispatch_head;
+          }
+
+          FMT_table[i] = zero_entry;
+          break;
+         }
+       }
+     }
+      /*************************************/
+
       /* commit head entry of RUU */
       RUU_head = (RUU_head + 1) % RUU_size;
       RUU_num--;
@@ -2464,12 +2500,32 @@ ruu_writeback(void)
      */
     {
       // Search for entry
-      for (int i = 0; i < FMT_MAX_NUM; i++) {
+      bmiss++;
+      int i = dispatch_head;
+      printf("head : %d, tail : %d\n", dispatch_head, dispatch_tail);
+      while (i != (dispatch_tail + 1) % FMT_MAX_NUM) {
+        printf("ROB num is %d\n", FMT_table[i].ROB_id);
         if (FMT_table[i].ROB_id == rs->ROB_id) {
+          global_counter.branch_penalty += (FMT_table[i].branch_penalty + ruu_branch_penalty);
+          printf("mispredict %d, add %d, now global is : %d\n", i , FMT_table[i].branch_penalty + ruu_branch_penalty, global_counter.branch_penalty);
+          dispatch_tail = i;
+          fetch = dispatch_tail;
+          dispatch_head = (dispatch_head + 1) % FMT_MAX_NUM;
+          
+          // FMT_table[i] = zero_entry;
           FMT_table[i].mispredict_bit = 1;
           break;
         }
+        i = (i + 1) % FMT_MAX_NUM;
       }
+
+      // printf("mispredict %d\n", dispatch_head);
+      // global_counter.branch_penalty += FMT_table[dispatch_head].branch_penalty + ruu_branch_penalty;
+      // dispatch_tail = dispatch_head;
+      // fetch = dispatch_tail;
+      // FMT_table[dispatch_head] = zero_entry;
+      // FMT_table[dispatch_head].mispredict_bit = 1;
+
     }
     /*************************************/
     
@@ -4018,9 +4074,15 @@ ruu_dispatch(void)
      * Modified for FMT
      * ROB allocated. Increase dispatch tail to here. 
      */
-    dispatch_tail = (dispatch_tail + 1) % FMT_MAX_NUM;
-    FMT_table[dispatch_tail].ROB_id = RUU_tail;
-    rs->ROB_id = RUU_tail;
+    if (MD_OP_FLAGS(op) & F_CTRL) {
+      dispatch_tail = (dispatch_tail + 1) % FMT_MAX_NUM;
+      printf("dispatch tail is %d, ROB id is %d\n", dispatch_tail, RUU_tail);
+      if (dispatch_tail >= (fetch + 1) % FMT_MAX_NUM) {
+        fetch = dispatch_tail;
+      }
+      FMT_table[dispatch_tail].ROB_id = RUU_tail;
+      rs->ROB_id = RUU_tail;
+    }
 
 	  /* split ld/st's into two operations: eff addr comp + mem access */
 	  if (MD_OP_FLAGS(op) & F_MEM)
@@ -4349,6 +4411,25 @@ ruu_fetch(void)
 	  if (lat != cache_il1_lat)
 	    {
 	      /* I-cache miss, block fetch until it is resolved */
+
+        /* 
+        * Modified for FMT
+        * I-cache miss. Increase count for delayed cycle.
+        */
+       if (!last_inst_tmissed) {
+        if (lat == cache_il2_lat) {
+            FMT_table[fetch].local_L1_I_cache += lat;
+        }
+          else {
+            FMT_table[fetch].local_L2_I_cache += lat - cache_il1_lat;
+          }
+       }
+       else {
+          FMT_table[fetch].local_I_TLB += tlb_lat; 
+       }
+
+        /*************************************/
+
 	      ruu_fetch_issue_delay += lat - 1;
 	      break;
 	    }
@@ -4399,6 +4480,7 @@ ruu_fetch(void)
          * Branch instruction fetched! allocate FMT table entry
          */
         fetch = (fetch + 1) % FMT_MAX_NUM;
+        printf("Fetched %d\n", fetch);
         FMT_table[fetch] = zero_entry;
         /***********************************************/
 
@@ -4530,6 +4612,12 @@ sim_main(void)
   /* ignore any floating point exceptions, they may occur on mis-speculated
      execution paths */
   signal(SIGFPE, SIG_IGN);
+
+  /* 
+    * Modified for FMT
+    */
+  init_FMT();
+  /*************************************/
 
   /* set up program entry state */
   regs.regs_PC = ld_prog_entry;
@@ -4702,9 +4790,34 @@ sim_main(void)
       /* go to next cycle */
       sim_cycle++;
 
+      /* 
+      * Modified for FMT
+      * Increament of branch penalty for all instruction in ROB
+      */
+      {
+        int i = dispatch_head;
+        while (i != dispatch_tail) {
+          FMT_table[i].branch_penalty++;
+          i = (i + 1) % FMT_MAX_NUM;
+        }
+        FMT_table[dispatch_tail].branch_penalty++;
+      }
+      /*************************************/
+
       /* finish early? */
       if (max_insts && sim_num_insn >= max_insts)
 	return;
-      if (program_complete) return;
+      if (program_complete) {
+        printf("\n\n/**********************************/\n");
+        printf("branch : %d\n", global_counter.branch_penalty);
+        printf("L1 miss : %d\n", global_counter.local_L1_I_cache);
+        printf("L2 miss : %d\n", global_counter.local_L2_I_cache);
+        printf("TLB miss : %d\n", global_counter.local_I_TLB);
+        printf("/*************************************/\n");
+        printf("Org is sequentially : %d\n", ruu_branch_penalty * recovery_count);
+        printf("Bmiss  count is %d\n", bmiss);
+        printf("/*************************************/\n\n");
+        return;
+      }
     }
 }
