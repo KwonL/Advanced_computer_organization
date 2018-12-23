@@ -2502,12 +2502,9 @@ ruu_writeback(void)
       // Search for entry
       bmiss++;
       int i = dispatch_head;
-      printf("head : %d, tail : %d\n", dispatch_head, dispatch_tail);
       while (i != (dispatch_tail + 1) % FMT_MAX_NUM) {
-        printf("ROB num is %d\n", FMT_table[i].ROB_id);
         if (FMT_table[i].ROB_id == rs->ROB_id) {
           global_counter.branch_penalty += (FMT_table[i].branch_penalty + ruu_branch_penalty);
-          printf("mispredict %d, add %d, now global is : %d\n", i , FMT_table[i].branch_penalty + ruu_branch_penalty, global_counter.branch_penalty);
           dispatch_tail = i;
           fetch = dispatch_tail;
           dispatch_head = (dispatch_head + 1) % FMT_MAX_NUM;
@@ -2525,6 +2522,12 @@ ruu_writeback(void)
       // fetch = dispatch_tail;
       // FMT_table[dispatch_head] = zero_entry;
       // FMT_table[dispatch_head].mispredict_bit = 1;
+
+      i = dispatch_tail;
+      while (i != ((dispatch_head + 1) % FMT_MAX_NUM)) {
+        FMT_table[i].branch_penalty = 0;
+        i = (i + 1) % FMT_MAX_NUM;
+      }
 
     }
     /*************************************/
@@ -4076,7 +4079,6 @@ ruu_dispatch(void)
      */
     if (MD_OP_FLAGS(op) & F_CTRL) {
       dispatch_tail = (dispatch_tail + 1) % FMT_MAX_NUM;
-      printf("dispatch tail is %d, ROB id is %d\n", dispatch_tail, RUU_tail);
       if (dispatch_tail >= (fetch + 1) % FMT_MAX_NUM) {
         fetch = dispatch_tail;
       }
@@ -4480,7 +4482,6 @@ ruu_fetch(void)
          * Branch instruction fetched! allocate FMT table entry
          */
         fetch = (fetch + 1) % FMT_MAX_NUM;
-        printf("Fetched %d\n", fetch);
         FMT_table[fetch] = zero_entry;
         /***********************************************/
 
@@ -4796,11 +4797,10 @@ sim_main(void)
       */
       {
         int i = dispatch_head;
-        while (i != dispatch_tail) {
+        while (i != (dispatch_tail + 1) % FMT_MAX_NUM) {
           FMT_table[i].branch_penalty++;
           i = (i + 1) % FMT_MAX_NUM;
         }
-        FMT_table[dispatch_tail].branch_penalty++;
       }
       /*************************************/
 
