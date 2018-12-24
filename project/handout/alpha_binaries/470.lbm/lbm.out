@@ -1,0 +1,7 @@
+MAIN_parseCommandLine:
+	size of file '100_100_130_ldc.of' is 33204 bytes
+	expected size is 1313130 bytes
+PC: 1200006C0
+FINISHED LOADER
+
+NO ERROR
