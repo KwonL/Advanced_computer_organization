@@ -4901,31 +4901,31 @@ sim_main(void)
       if (max_insts && sim_num_insn >= max_insts)
 	return;
       if (program_complete) {
-        printf("\n\n/**********************************/\n");
-        printf("F:branch\t%d\n", global_counter.branch_penalty);
-        printf("F:iL1 miss\t%d\n", global_counter.local_L1_I_cache);
-        printf("F:iL2 miss\t%d\n", global_counter.local_L2_I_cache);
-        printf("F:iTLB miss\t%d\n", global_counter.local_I_TLB);
-        printf("F:dL1 miss\t%d\n", global_counter.local_L1_D_cache);
-        printf("F:dL2 miss\t%d\n", global_counter.local_L2_D_cache);
-        printf("F:dTLB miss\t%d\n", global_counter.local_D_TLB);
-        printf("/*************************************/\n");
-        printf("o:branch\t%d\n", ruu_branch_penalty * recovery_count);
-        printf("o:iL1 miss\t %d\n", il1_miss_cnt * cache_il2_lat);
-        printf("o:iL2 miss\t%d\n", il2_miss_cnt * 32);
-        printf("o:iTLB miss\t%d\n", itlb->misses * tlb_miss_lat);
-        printf("o:dL1 miss\t%d\n", dl1_miss_cnt * cache_dl2_lat);
-        printf("o:dL2 miss\t%d\n", dl2_miss_lat_cnt);
-        printf("o:dTLB miss\t%d\n", dtlb->misses * tlb_miss_lat);
-        printf("/*************************************/\n");
-        printf("s:branc\t %d\n", global_counter.branch_penalty);
-        printf("s:iL1 miss\t%d\n", sFMT_global.local_L1_I_cache);
-        printf("s:iL2 miss\t%d\n", sFMT_global.local_L2_I_cache);
-        printf("s:iTLB miss\t %d\n", sFMT_global.local_I_TLB);
-        printf("s:dL1 miss\t%d\n", global_counter.local_L1_D_cache);
-        printf("s:dL2 miss\t%d\n", global_counter.local_L2_D_cache);
-        printf("s:dTLB miss\t%d\n", global_counter.local_D_TLB);
-        printf("/*************************************/\n\n");
+        fprintf(stderr, "\n\n/**********************************/\n");
+        fprintf(stderr, "F:branch\t%d\n", global_counter.branch_penalty);
+        fprintf(stderr, "F:iL1 miss\t%d\n", global_counter.local_L1_I_cache);
+        fprintf(stderr, "F:iL2 miss\t%d\n", global_counter.local_L2_I_cache);
+        fprintf(stderr, "F:iTLB miss\t%d\n", global_counter.local_I_TLB);
+        fprintf(stderr, "F:dL1 miss\t%d\n", global_counter.local_L1_D_cache);
+        fprintf(stderr, "F:dL2 miss\t%d\n", global_counter.local_L2_D_cache);
+        fprintf(stderr, "F:dTLB miss\t%d\n", global_counter.local_D_TLB);
+        fprintf(stderr, "/*************************************/\n");
+        fprintf(stderr, "o:branch\t%d\n", ruu_branch_penalty * recovery_count);
+        fprintf(stderr, "o:iL1 miss\t %d\n", il1_miss_cnt * cache_il2_lat);
+        fprintf(stderr, "o:iL2 miss\t%d\n", il2_miss_cnt * 32);
+        fprintf(stderr, "o:iTLB miss\t%d\n", itlb->misses * tlb_miss_lat);
+        fprintf(stderr, "o:dL1 miss\t%d\n", dl1_miss_cnt * cache_dl2_lat);
+        fprintf(stderr, "o:dL2 miss\t%d\n", dl2_miss_lat_cnt);
+        fprintf(stderr, "o:dTLB miss\t%d\n", dtlb->misses * tlb_miss_lat);
+        fprintf(stderr, "/*************************************/\n");
+        fprintf(stderr, "s:branc\t %d\n", global_counter.branch_penalty);
+        fprintf(stderr, "s:iL1 miss\t%d\n", sFMT_global.local_L1_I_cache);
+        fprintf(stderr, "s:iL2 miss\t%d\n", sFMT_global.local_L2_I_cache);
+        fprintf(stderr, "s:iTLB miss\t %d\n", sFMT_global.local_I_TLB);
+        fprintf(stderr, "s:dL1 miss\t%d\n", global_counter.local_L1_D_cache);
+        fprintf(stderr, "s:dL2 miss\t%d\n", global_counter.local_L2_D_cache);
+        fprintf(stderr, "s:dTLB miss\t%d\n", global_counter.local_D_TLB);
+        fprintf(stderr, "/*************************************/\n\n");
         return;
       }
     }
