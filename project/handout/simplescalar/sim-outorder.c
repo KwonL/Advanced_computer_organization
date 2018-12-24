@@ -460,7 +460,7 @@ static struct FMT_entry zero_entry = { 0 };
 static int il1_miss_cnt = 0;
 static int il2_miss_cnt = 0;
 static int dl1_miss_cnt = 0;
-static int dl2_miss_lat_cnt = 0;
+static int dl2_miss_cnt = 0;
 static int itlb_miss_cnt = 0;
 static int dtlb_miss_cnt = 0;
 
@@ -469,6 +469,8 @@ static struct FMT_entry sFMT_global;
 static int il1_miss_bit;
 static int il2_miss_bit;
 static int itlb_miss_bit;
+
+static int last_lat = 0;
 
 static void init_FMT(void) {
   zero_entry.ROB_id = -1;
@@ -558,13 +560,6 @@ if (cache_il2)
       /* access next level of inst cache hierarchy */
       lat = cache_access(cache_il2, cmd, baddr, NULL, bsize,
 			 /* now */now, /* pudata */NULL, /* repl addr */NULL);
-
-      /* 
-      * Modified for FMT
-      * Miss at I-L2 cache. 
-      */
-      FMT_table[fetch].local_L1_I_cache = lat;
-      /*************************************/
 
       if (cmd == Read)
 	return lat;
@@ -1615,6 +1610,8 @@ struct RUU_station {
     int il1_miss_bit;
     int il2_miss_bit;
     int itlb_miss_bit;
+
+    int d_cache_lat;
     /*************************************/
 };
 
@@ -2292,9 +2289,6 @@ ruu_commit(void)
                global_counter.local_L2_D_cache += lat - cache_dl2_lat;
              }
            }
-
-           if (lat == cache_dl2_lat) dl1_miss_cnt++;
-           else dl2_miss_lat_cnt += (lat - cache_dl2_lat);
             /****************************************************/
 			      events |= PEV_CACHEMISS;
           }
@@ -2947,8 +2941,22 @@ ruu_issue(void)
 				    cache_access(cache_dl1, Read,
 						 (rs->addr & ~3), NULL, 4,
 						 sim_cycle, NULL, NULL);
-				  if (load_lat > cache_dl1_lat)
+				  if (load_lat > cache_dl1_lat) {
+            /* 
+             * Modified for FMT
+             */
+            if (!(load_lat >= mem_lat[0])) {
+              global_counter.local_L1_D_cache += load_lat;
+              dl1_miss_cnt++;
+            } else {
+              global_counter.local_L2_D_cache += load_lat;
+              dl2_miss_cnt++;
+              printf("L2 miss on load! %d\n", load_lat);
+            }
+            /***********************************/
+            
 				    events |= PEV_CACHEMISS;
+          }
 				}
 			      else
 				{
@@ -4500,7 +4508,7 @@ ruu_fetch(void)
         * I-cache miss. Increase count for delayed cycle.
         */
        if (!last_inst_tmissed) {
-        if (lat == cache_il2_lat) {
+        if (!(lat >= mem_lat[0])) {
           // sFMT
           sFMT_local.local_L1_I_cache += lat;
           il1_miss_bit = 1;
@@ -4900,6 +4908,14 @@ sim_main(void)
           i = (i + 1) % FMT_MAX_NUM;
         }
       }
+        // if (RUU[RUU_head].d_cache_lat) {
+        //   if (!(last_lat >= mem_lat[0])) {
+        //     global_counter.local_L1_D_cache += last_lat;
+        //   } else {
+        //     global_counter.local_L2_D_cache += last_lat;
+        //   }
+        //   RUU[RUU_head].d_cache_lat = 0;
+        // }
       /*************************************/
 
       /* finish early? */
@@ -4915,13 +4931,13 @@ sim_main(void)
         fprintf(stderr, "/*************************************/\n");
         fprintf(stderr, "o:branch\t%d\n", ruu_branch_penalty * recovery_count);
         fprintf(stderr, "o:iL1 miss\t %d\n", il1_miss_cnt * cache_il2_lat);
-        fprintf(stderr, "o:iL2 miss\t%d\n", il2_miss_cnt * 32);
+        fprintf(stderr, "o:iL2 miss\t%d\n", il2_miss_cnt * mem_lat[0]);
         fprintf(stderr, "o:iTLB miss\t%d\n", itlb_miss_cnt * tlb_miss_lat);
         fprintf(stderr, "o:dL1 miss\t%d\n", dl1_miss_cnt * cache_dl2_lat);
-        fprintf(stderr, "o:dL2 miss\t%d\n", dl2_miss_lat_cnt);
+        fprintf(stderr, "o:dL2 miss\t%d\n", dl2_miss_cnt * mem_lat[0]);
         fprintf(stderr, "o:dTLB miss\t%d\n", dtlb_miss_cnt * tlb_miss_lat);
         fprintf(stderr, "/*************************************/\n");
-        fprintf(stderr, "s:branc\t %d\n", global_counter.branch_penalty);
+        fprintf(stderr, "s:branch\t %d\n", global_counter.branch_penalty);
         fprintf(stderr, "s:iL1 miss\t%d\n", sFMT_global.local_L1_I_cache);
         fprintf(stderr, "s:iL2 miss\t%d\n", sFMT_global.local_L2_I_cache);
         fprintf(stderr, "s:iTLB miss\t %d\n", sFMT_global.local_I_TLB);
@@ -4929,6 +4945,7 @@ sim_main(void)
         fprintf(stderr, "s:dL2 miss\t%d\n", global_counter.local_L2_D_cache);
         fprintf(stderr, "s:dTLB miss\t%d\n", global_counter.local_D_TLB);
         fprintf(stderr, "/*************************************/\n\n");
+        fprintf(stderr, "dl2 miss cnt : %d\n", dl2_miss_cnt);
         return;
       }
       if (program_complete) {
@@ -4946,10 +4963,10 @@ sim_main(void)
         fprintf(stderr, "o:iL2 miss\t%d\n", il2_miss_cnt * mem_lat[0]);
         fprintf(stderr, "o:iTLB miss\t%d\n", itlb_miss_cnt * tlb_miss_lat);
         fprintf(stderr, "o:dL1 miss\t%d\n", dl1_miss_cnt * cache_dl2_lat);
-        fprintf(stderr, "o:dL2 miss\t%d\n", dl2_miss_lat_cnt);
+        fprintf(stderr, "o:dL2 miss\t%d\n", dl2_miss_cnt * mem_lat[0]);
         fprintf(stderr, "o:dTLB miss\t%d\n", dtlb_miss_cnt * tlb_miss_lat);
         fprintf(stderr, "/*************************************/\n");
-        fprintf(stderr, "s:branc\t %d\n", global_counter.branch_penalty);
+        fprintf(stderr, "s:branch\t %d\n", global_counter.branch_penalty);
         fprintf(stderr, "s:iL1 miss\t%d\n", sFMT_global.local_L1_I_cache);
         fprintf(stderr, "s:iL2 miss\t%d\n", sFMT_global.local_L2_I_cache);
         fprintf(stderr, "s:iTLB miss\t %d\n", sFMT_global.local_I_TLB);
@@ -4957,6 +4974,7 @@ sim_main(void)
         fprintf(stderr, "s:dL2 miss\t%d\n", global_counter.local_L2_D_cache);
         fprintf(stderr, "s:dTLB miss\t%d\n", global_counter.local_D_TLB);
         fprintf(stderr, "/*************************************/\n\n");
+        fprintf(stderr, "dl2 miss cnt : %d\n", dl2_miss_cnt);
         return;
       }
     }
