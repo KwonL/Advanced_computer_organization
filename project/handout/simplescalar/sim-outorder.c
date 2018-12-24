@@ -2285,8 +2285,10 @@ ruu_commit(void)
            if (RUU_tail == ((RUU_head + 1) % RUU_size)) {
              if (lat == cache_dl2_lat) {
                global_counter.local_L1_D_cache += lat;
+               dl1_miss_cnt++;
              } else {
                global_counter.local_L2_D_cache += lat - cache_dl2_lat;
+               dl2_miss_cnt++;
              }
            }
             /****************************************************/
@@ -4775,7 +4777,7 @@ sim_main(void)
 	  MD_SET_OPCODE(op, inst);
 
 	  /* execute the instruction */
-	  fprintf(stderr, "inst: %d\n", op);
+	  // fprintf(stderr, "inst: %d\n", op);
 	  switch (op)
 	    {
 #define DEFINST(OP,MSK,NAME,OPFORM,RES,FLAGS,O1,O2,I1,I2,I3)		\
