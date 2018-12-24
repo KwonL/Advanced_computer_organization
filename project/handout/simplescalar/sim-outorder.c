@@ -2951,7 +2951,6 @@ ruu_issue(void)
             } else {
               global_counter.local_L2_D_cache += load_lat;
               dl2_miss_cnt++;
-              printf("L2 miss on load! %d\n", load_lat);
             }
             /***********************************/
             
