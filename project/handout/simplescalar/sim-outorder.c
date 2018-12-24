@@ -4943,7 +4943,7 @@ sim_main(void)
         fprintf(stderr, "/*************************************/\n");
         fprintf(stderr, "o:branch\t%d\n", ruu_branch_penalty * recovery_count);
         fprintf(stderr, "o:iL1 miss\t %d\n", il1_miss_cnt * cache_il2_lat);
-        fprintf(stderr, "o:iL2 miss\t%d\n", il2_miss_cnt * 250);
+        fprintf(stderr, "o:iL2 miss\t%d\n", il2_miss_cnt * mem_lat[0]);
         fprintf(stderr, "o:iTLB miss\t%d\n", itlb_miss_cnt * tlb_miss_lat);
         fprintf(stderr, "o:dL1 miss\t%d\n", dl1_miss_cnt * cache_dl2_lat);
         fprintf(stderr, "o:dL2 miss\t%d\n", dl2_miss_lat_cnt);
